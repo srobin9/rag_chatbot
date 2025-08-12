@@ -1,4 +1,5 @@
 ./data-ingestion/env.yaml
+./backfill/backfill-env/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
