@@ -2,11 +2,13 @@ import base64
 import io
 import json
 import os
+import pg8000.dbapi
+import ssl
 
 import pandas as pd
 import vertexai
 from flask import Flask, request
-from google.cloud import alloydb, storage
+# from google.cloud import alloydb, storage
 from PIL import Image
 from pypdf import PdfReader
 from vertexai.vision_models import Image as VisionImage
@@ -15,40 +17,56 @@ from vertexai.vision_models import MultiModalEmbeddingModel
 # --- 환경 변수 및 클라이언트 초기화 ---
 PROJECT_ID = os.environ.get("GCP_PROJECT")
 REGION = os.environ.get("REGION", "asia-northeast3")
+DB_HOST = os.environ.get("DB_HOST")  # PSC DNS 이름
 DB_USER = os.environ.get("DB_USER")
 DB_PASS = os.environ.get("DB_PASS")
 DB_NAME = os.environ.get("DB_NAME")
 # DB_INSTANCE_CONNECTION_NAME 형식: "project:region:cluster:instance"
-DB_CONNECTION_NAME = os.environ.get("DB_CONNECTION_NAME") 
+# DB_CONNECTION_NAME = os.environ.get("DB_CONNECTION_NAME") 
 
 # Vertex AI 초기화
 vertexai.init(project=PROJECT_ID, location=REGION)
 
 # 클라이언트 초기화
 storage_client = storage.Client()
-db_connector = alloydb.Connector()
+# db_connector = alloydb.Connector()
 embedding_model = MultiModalEmbeddingModel.from_pretrained("multimodalembedding@001")
 
 app = Flask(__name__)
 
+# AlloyDB는 암호화된 연결(SSL)이 필요합니다.
+# Cloud Run 환경에 맞게 SSL 컨텍스트를 생성합니다.
+ssl_context = ssl.create_default_context()
+ssl_context.check_hostname = False
+ssl_context.verify_mode = ssl.CERT_NONE
+
 # --- Helper Functions ---
 def get_db_connection():
-    """AlloyDB와 안전하게 연결합니다."""
-    conn = db_connector.connect(
-        DB_CONNECTION_NAME,
-        "pg8000",
-        user=DB_USER,
-        password=DB_PASS,
-        db=DB_NAME,
-        ip_type="PRIVATE"
-    )
-    return conn
+    """VPC 커넥터를 통해 PSC 엔드포인트에 직접 연결합니다."""
+    try:
+        conn = pg8000.dbapi.connect(
+            host=DB_HOST,
+            port=5432,
+            user=DB_USER,
+            password=DB_PASS,
+            database=DB_NAME,
+            ssl_context=ssl_context
+        )
+        return conn
+    except Exception as e:
+        print(f"Error connecting to database: {e}")
+        raise
 
 def embed_content(image_bytes=None, text=None):
-    """텍스트 또는 이미지를 멀티모달 임베딩합니다."""
+    """
+    텍스트, 이미지, 또는 둘 다를 사용하여 일관된 1408차원 벡터를 생성합니다.
+    """
     vision_image = VisionImage(image_bytes=image_bytes) if image_bytes else None
     
     # 모델 호출
+    # 텍스트만 있는 경우, contextual_text에만 값이 전달되어 텍스트 임베딩 역할을 수행합니다.
+    # 이미지만 있는 경우, image에만 값이 전달됩니다.
+    # 둘 다 있는 경우, 두 문맥을 모두 이해하여 벡터를 생성합니다.
     embeddings = embedding_model.embed_image(
         image=vision_image,
         contextual_text=text,

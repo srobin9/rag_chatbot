@@ -1,3 +1,9 @@
+### **RAG PoC 아키텍처 구축 가이드**
+
+본 문서는 Google Cloud Platform(GCP) 상에 RAG(Retrieval-Augmented Generation) 시스템 PoC를 구축하는 전체 과정을 안내합니다. 아키텍처는 데이터 수집, 처리, 임베딩, 서빙 및 평가 파이프라인으로 구성됩니다.
+
+---
+
 ### **Phase 1: 환경 설정 및 사전 준비 (Setup & Prerequisites)**
 
 가장 먼저 아키텍처에 필요한 Google Cloud 서비스들을 활성화하고, 데이터베이스와 스토리지, 통신 채널을 설정해야 합니다.
@@ -24,26 +30,44 @@ gcloud services enable \
 
 벡터 데이터를 저장할 AlloyDB를 생성하고, 벡터 검색을 위한 `pgvector` 확장을 활성화합니다.
 
-1.  **AlloyDB 클러스터 및 인스턴스 생성:** [Cloud Console](https://console.cloud.google.com/alloydb)을 통해 또는 `gcloud` 명령어로 클러스터와 기본 인스턴스를 생성합니다.
-2.  **데이터베이스 생성:** 인스턴스에 연결하여 사용할 데이터베이스를 생성합니다. (예: `poc_db`)
-3.  **pgvector 확장 활성화 및 테이블 생성:**
-    `psql` 등을 통해 데이터베이스에 접속한 후, 다음 SQL 쿼리를 실행합니다.
+1.  **AlloyDB 클러스터 및 인스턴스 생성:**
+    *   Cloud Console 또는 `gcloud`를 사용하여 클러스터와 기본 인스턴스를 생성합니다. 이때, **Private Service Connect(PSC)를 사용**하여 비공개 IP 연결을 설정합니다.
 
-    ```sql
-    -- pgvector 확장 기능 활성화
-    CREATE EXTENSION IF NOT EXISTS vector;
+2.  **PSC 연결 수락:**
+    *   AlloyDB 인스턴스의 '연결' 탭으로 이동합니다.
+    *   'PSC 엔드포인트' 섹션에서 상태가 **`⚠️ 확인 필요`**인 연결 요청을 **수락(Accept)**합니다.
+    *   **[중요]** 만약 조직 정책 오류로 수락이 불가능하다면, [트러블슈팅](#q-alloydb-psc-엔드포인트-연결-수락이-실패합니다) 섹션을 참조하세요.
+    *   수락이 완료되면 엔드포인트 상태가 **`✅ 수락됨`**으로 바뀌고, 내부 IP와 **DNS 이름**이 할당됩니다. 이 DNS 이름을 다음 단계에서 사용합니다.
 
-    -- 벡터 데이터와 원본 텍스트를 저장할 테이블 생성
-    CREATE TABLE document_embeddings (
-        id SERIAL PRIMARY KEY,
-        source_file VARCHAR(1024),
-        chunk_description TEXT, -- 이 청크가 무엇에 대한 것인지 설명 (예: "3페이지의 아키텍처 다이어그램")
-        embedding VECTOR(1408) -- 멀티모달 임베딩 모델의 차원 수
-    );
+3.  **데이터베이스 접속 및 생성:**
+    *   AlloyDB는 VPC 내부에 있으므로, **동일한 VPC에 연결된 GCE VM**을 통해 접속해야 합니다.
+    *   GCE VM에 SSH로 접속한 후, 아래 명령어로 `psql` 클라이언트를 사용하여 접속합니다. `[PSC_DNS_NAME]`을 위에서 확인한 DNS 이름으로 변경하세요.
+        ```bash
+        # psql 클라이언트가 없다면 설치: sudo apt-get update && sudo apt-get install -y postgresql-client
+        psql -h [PSC_DNS_NAME] -U postgres -d postgres
+        ```
+    *   접속 후, PoC에 사용할 데이터베이스를 생성합니다.
+        ```sql
+        CREATE DATABASE document_embeddings;
+        ```
 
-    -- 벡터 검색 속도를 높이기 위한 HNSW 인덱스 생성 (선택 사항이지만 강력히 권장)
-    CREATE INDEX ON document_embeddings
-    USING hnsw (embedding vector_l2_ops);
+4.  **`pgvector` 확장 활성화 및 테이블 생성:**
+    *   새로 만든 데이터베이스에 다시 접속(`\c document_embeddings`)한 후, 다음 SQL 쿼리를 실행합니다.
+        ```sql
+        -- pgvector 확장 기능 활성화
+        CREATE EXTENSION IF NOT EXISTS vector;
+
+        -- 벡터 데이터와 메타데이터를 저장할 테이블 생성
+        CREATE TABLE document_embeddings (
+            id SERIAL PRIMARY KEY,
+            source_file VARCHAR(1024),
+            chunk_description TEXT, -- 이 청크가 무엇에 대한 것인지 설명 (예: "3페이지의 아키텍처 다이어그램")
+            embedding VECTOR(1408) -- multimodalembedding@001 모델의 차원 수
+        );
+
+        -- 벡터 검색 속도를 높이기 위한 HNSW 인덱스 생성 (선택 사항이지만 강력히 권장)
+        CREATE INDEX ON document_embeddings
+        USING hnsw (embedding vector_l2_ops);
     ```
 
 #### **3. Pub/Sub 토픽 생성**
@@ -70,222 +94,59 @@ gcloud storage buckets notifications create gs://[YOUR_GCS_BUCKET_NAME] \
 
 이 단계에서는 GCS에 파일이 업로드되면 이를 감지하여 내용을 분석/추출/청킹하고, 벡터로 변환하여 AlloyDB에 저장하는 Cloud Run 서비스를 구현합니다.
 
-#### **1. Cloud Run 서비스 코드 작성 (File Processor)**
+#### **1. Cloud Run 서비스 코드 준비**
 
-이 서비스는 Pub/Sub 메시지를 받아 해당 파일을 처리하는 역할을 합니다. Gemini 1.5 Pro의 멀티모달 기능을 활용하면 PDF, 이미지(JPG, PNG), Excel(XLS) 등 다양한 형식의 파일을 단일 모델로 처리할 수 있습니다.
+`~/rag_chatbot/data-ingestion/` 디렉토리의 `main.py` 및 `requirements.txt` 코드가 PSC를 통해 DB에 접속하도록 준비되었는지 확인합니다. 특히 `main.py`는 환경 변수(`DB_HOST`)를 사용하여 DB에 접속해야 합니다.
 
-**`main.py` (Python, Flask 사용 예시)**
+#### **2. 환경 변수 파일 생성**
 
-```python
-import base64
-import json
-import os
-import re
+명령어에 비밀번호 등 민감 정보를 직접 노출하는 것은 위험하며, 특수 문자(`!`, `$`)로 인한 오류를 유발합니다. `env.yaml` 파일을 생성하여 안전하게 환경 변수를 관리합니다.
 
-import vertexai
-from flask import Flask, request
-from google.cloud import alloydb, storage
-from vertexai.generative_models import GenerationConfig, GenerativeModel, Part
+`~/rag_chatbot/data-ingestion/env.yaml` 파일을 아래 내용으로 생성하세요.
 
-# --- 환경 변수 및 클라이언트 초기화 ---
-PROJECT_ID = os.environ.get("GCP_PROJECT")
-REGION = os.environ.get("REGION", "asia-northeast3")
-DB_USER = os.environ.get("DB_USER")
-DB_PASS = os.environ.get("DB_PASS")
-DB_NAME = os.environ.get("DB_NAME")
-DB_INSTANCE_IP = os.environ.get("DB_INSTANCE_IP") # AlloyDB Private IP
-
-# Vertex AI 초기화
-vertexai.init(project=PROJECT_ID, location=REGION)
-
-# 스토리지 클라이언트
-storage_client = storage.Client()
-
-# AlloyDB 커넥터
-db_connector = alloydb.Connector()
-
-# Gemini 1.5 Pro 모델 로드
-multimodal_model = GenerativeModel("gemini-1.5-pro-001")
-
-# Flask 앱
-app = Flask(__name__)
-
-# --- Helper Functions ---
-
-def get_db_connection():
-    """AlloyDB와 안전하게 연결합니다."""
-    conn = db_connector.connect(
-        f"projects/{PROJECT_ID}/locations/{REGION}/clusters/[YOUR_ALLOYDB_CLUSTER_ID]/instances/[YOUR_ALLOYDB_INSTANCE_ID]",
-        "pg8000",
-        user=DB_USER,
-        password=DB_PASS,
-        db=DB_NAME,
-        ip_type="PRIVATE" # VPC 내에서 통신
-    )
-    return conn
-
-def get_text_embedding(text):
-    """주어진 텍스트에 대한 임베딩 벡터를 생성합니다."""
-    model = GenerativeModel("text-embedding-004")
-    result = model.generate_content([text])
-    # 첫 번째 콘텐츠의 첫 번째 부분에서 임베딩 값을 추출
-    if result.candidates and result.candidates[0].content.parts:
-        return result.candidates[0].content.parts[0].embedding
-    return None
-
-
-def extract_and_chunk_content(bucket_name, file_name):
-    """
-    GCS에서 파일을 다운로드하고 Gemini를 사용하여 텍스트를 추출 및 청킹합니다.
-    """
-    bucket = storage_client.bucket(bucket_name)
-    blob = bucket.blob(file_name)
-    file_bytes = blob.download_as_bytes()
-    
-    # MIME 타입 추론 (파일 확장자 기반)
-    mime_type = blob.content_type
-    if not mime_type:
-        if file_name.lower().endswith('.pdf'):
-            mime_type = 'application/pdf'
-        elif file_name.lower().endswith(('.png', '.jpg', '.jpeg')):
-            mime_type = f'image/{file_name.lower().split(".")[-1]}'
-        # 기타 타입 추가 가능 (e.g., 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' for xlsx)
-        # Gemini 1.5 Pro는 다양한 포맷을 지원합니다.
-    
-    # Gemini 1.5 Pro에 보낼 프롬프트 구성
-    prompt = """
-    당신은 문서 분석 전문가입니다. 주어진 파일(이미지, PDF, 오피스 문서 등)의 내용을 분석하여 가장 핵심적인 텍스트 정보를 추출하고, 의미적으로 완결된 여러 개의 단락(chunk)으로 나누어주세요. 각 단락은 검색 및 답변 생성에 사용하기 좋은 크기여야 합니다.
-
-    출력 형식은 반드시 아래의 JSON 형식이어야 합니다. 다른 설명은 추가하지 마세요.
-
-    {
-      "chunks": [
-        "첫 번째 텍스트 단락입니다.",
-        "두 번째 의미 있는 텍스트 단락입니다.",
-        "..."
-      ]
-    }
-    """
-    
-    # 멀티모달 요청 생성
-    file_part = Part.from_data(data=file_bytes, mime_type=mime_type)
-    generation_config = GenerationConfig(response_mime_type="application/json")
-    
-    response = multimodal_model.generate_content([prompt, file_part], generation_config=generation_config)
-    
-    try:
-        # JSON 응답 파싱
-        response_json = json.loads(response.text)
-        return response_json.get("chunks", [])
-    except (json.JSONDecodeError, AttributeError) as e:
-        print(f"Error parsing Gemini response: {e}\nResponse text: {response.text}")
-        return []
-
-# --- Flask 라우트 ---
-
-@app.route("/", methods=["POST"])
-def process_pubsub_event():
-    envelope = request.get_json()
-    if not envelope or "message" not in envelope:
-        print("Bad Request: invalid Pub/Sub message format")
-        return "Bad Request", 400
-
-    pubsub_message = envelope["message"]
-    if "data" in pubsub_message:
-        # 데이터는 base64로 인코딩되어 있습니다.
-        data = base64.b64decode(pubsub_message["data"]).decode("utf-8")
-        message_json = json.loads(data)
-        
-        bucket_name = message_json.get("bucket")
-        file_name = message_json.get("name")
-
-        if not bucket_name or not file_name:
-            print(f"Invalid message format: {message_json}")
-            return "Bad Request", 400
-
-        print(f"Processing file: gs://{bucket_name}/{file_name}")
-
-        # 1. Gemini로 콘텐츠 추출 및 청킹
-        chunks = extract_and_chunk_content(bucket_name, file_name)
-        if not chunks:
-            print("No content chunks extracted.")
-            return "OK", 204
-
-        # 2. 각 청크를 임베딩하고 DB에 저장
-        conn = get_db_connection()
-        with conn.cursor() as cursor:
-            for chunk in chunks:
-                if not chunk.strip(): # 비어있는 청크는 건너뛰기
-                    continue
-                
-                # 임베딩 생성
-                embedding = get_text_embedding(chunk)
-                if embedding:
-                    # AlloyDB에 저장
-                    cursor.execute(
-                        "INSERT INTO document_embeddings (source_file, content, embedding) VALUES (%s, %s, %s)",
-                        (f"gs://{bucket_name}/{file_name}", chunk, embedding)
-                    )
-        conn.commit()
-        conn.close()
-
-        print(f"Successfully processed and embedded {len(chunks)} chunks from {file_name}.")
-        return "OK", 204
-    
-    return "OK", 204
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
-
+```yaml
+REGION: "asia-northeast3"
+DB_HOST: "[PSC_DNS_NAME]"  # 1단계에서 확인한 AlloyDB의 PSC DNS 이름
+DB_USER: "postgres"
+DB_PASS: "[YOUR_DB_PASSWORD]" # 비밀번호에 특수문자가 있어도 그대로 입력
+DB_NAME: "document_embeddings"
 ```
 
-**`requirements.txt`**
+#### **3. Cloud Run 서비스 배포**
 
+`main.py`가 있는 디렉토리에서 다음 명령어를 실행하여 서비스를 배포합니다.
+
+```bash
+cd ~/rag_chatbot/data-ingestion
+
+gcloud run deploy file-processor-service \
+    --source . \
+    --platform managed \
+    --region asia-northeast3 \
+    --allow-unauthenticated \
+    --vpc-connector [VPC_CONNECTOR_IN_asia-northeast3] \
+    --env-vars-from-file=env.yaml \
+    --service-account [SERVICE_ACCOUNT_EMAIL]
 ```
-Flask==3.0.0
-gunicorn==21.2.0
-google-cloud-aiplatform>=1.47.0
-google-cloud-storage>=2.14.0
-google-cloud-alloydb[pg8000]>=0.1.0
-```
 
-#### **2. Cloud Run 서비스 배포**
+*   **`[VPC_CONNECTOR_IN_asia-northeast3]`**: Cloud Run과 **동일한 리전 및 VPC**에 생성된 서버리스 VPC 액세스 커넥터의 이름입니다.
+*   **`[SERVICE_ACCOUNT_EMAIL]`**: 배포에 사용할 서비스 계정입니다. 이 계정은 다음 권한을 필수로 가집니다.
+    *   Vertex AI 사용자 (`roles/aiplatform.user`)
+    *   Storage 객체 뷰어 (`roles/storage.objectViewer`)
+    *   **서버리스 VPC 액세스 사용자 (`roles/vpcaccess.user`)**
 
-위에서 작성한 코드를 Cloud Run에 배포합니다.
+*   **[중요]** 배포 시 VPC 커넥터 권한 오류가 발생하면 [트러블슈팅](#q-gcloud-run-deploy-실행-시-vpc-커넥터-오류가-발생합니다) 섹션을 반드시 확인하세요.
 
-1.  **VPC 커넥터 생성:** Cloud Run이 AlloyDB의 Private IP와 통신하려면 [서버리스 VPC 액세스 커넥터](https://console.cloud.google.com/vpc/connectors)가 필요합니다. AlloyDB가 있는 VPC 네트워크에 커넥터를 생성합니다.
-
-2.  **서비스 배포:**
-    `main.py`와 `requirements.txt`가 있는 디렉토리에서 다음 명령어를 실행합니다. `[...]` 부분을 실제 값으로 대체하세요.
-
-    ```bash
-    gcloud run deploy file-processor-service \
-        --source . \
-        --platform managed \
-        --region [YOUR_REGION] \
-        --allow-unauthenticated \
-        --vpc-connector [YOUR_VPC_CONNECTOR_NAME] \
-        --set-env-vars "REGION=[YOUR_REGION],DB_USER=[YOUR_DB_USER],DB_PASS=[YOUR_DB_PASSWORD],DB_NAME=[YOUR_DB_NAME],DB_INSTANCE_IP=[YOUR_ALLOYDB_INSTANCE_IP]" \
-        --service-account [SERVICE_ACCOUNT_EMAIL] # 아래 참고
-    ```
-
-    *   **서비스 계정 권한:** 배포에 사용되는 서비스 계정(`[SERVICE_ACCOUNT_EMAIL]`)은 다음 역할을 가지고 있어야 합니다:
-        *   Vertex AI 사용자 (roles/aiplatform.user)
-        *   AlloyDB 클라이언트 (roles/alloydb.client)
-        *   Storage 객체 뷰어 (roles/storage.objectViewer)
-
-#### **3. Pub/Sub 구독 생성**
+#### **4. Pub/Sub 구독 생성**
 
 GCS 알림 토픽과 `file-processor-service`를 연결하는 Push 구독을 생성합니다.
 
 ```bash
 gcloud pubsub subscriptions create gcs-file-event-subscription \
     --topic gcs-file-events \
-    --push-endpoint=[YOUR_CLOUD_RUN_SERVICE_URL] \
+    --push-endpoint=$(gcloud run services describe file-processor-service --platform managed --region asia-northeast3 --format "value(status.url)") \
     --push-auth-service-account=[CLOUD_RUN_INVOKER_SERVICE_ACCOUNT_EMAIL]
 ```
-
-이제 GCS 버킷에 파일이 업로드되면 자동으로 Cloud Run 서비스가 실행되어 파일 내용을 분석, 임베딩 후 AlloyDB에 저장합니다.
 
 ---
 
@@ -407,4 +268,57 @@ CREATE OR REPLACE TABLE `[YOUR_PROJECT_ID].[YOUR_DATASET_ID].evaluation_results`
 
 ---
 
-이 가이드가 제시해주신 아키텍처를 성공적으로 구현하는 데 도움이 되기를 바랍니다. 각 단계별로 필요한 권한이나 네트워크 설정 등 세부적인 부분에서 문제가 발생하면 언제든지 추가 질문을 남겨주세요.
+### **트러블슈팅 (Troubleshooting)**
+
+#### Q: GCE VM에서 AlloyDB로 `psql` 접속이 안 됩니다 (I/O Timeout 등).
+
+**A:** 이것은 대부분 PSC 연결 문제입니다. 아래 순서대로 확인하세요.
+1.  **PSC 엔드포인트 상태 확인:** AlloyDB 인스턴스의 '연결' 탭에서 PSC 엔드포인트 상태가 `✅ 수락됨`이고, 내부 IP가 할당되었는지 확인하세요. `⚠️ 확인 필요` 상태라면 다음 단계를 진행하세요.
+2.  **Service Connection Policy 확인:** `확인 필요` 상태의 원인은 조직의 보안 정책(`ServiceConnectionPolicy`)이 연결을 막고 있기 때문입니다. 조직 관리자 권한으로 아래 명령어를 실행하여 `dev-vpc` 네트워크가 `alloydb.googleapis.com` 서비스에 접속할 수 있도록 허용하는 정책을 생성해야 합니다.
+    ```bash
+    gcloud network-connectivity service-connection-policies create allow-alloydb-for-dev-vpc \
+        --service-class=alloydb.googleapis.com \
+        --network=projects/[YOUR_PROJECT_ID]/global/networks/dev-vpc \
+        --consumer-resource-roots=projects/[YOUR_PROJECT_ID] \
+        --location=global \
+        --project=[YOUR_PROJECT_ID]
+    ```
+3.  **정책 생성 후 연결 수락:** 위 명령어가 성공하면, 다시 AlloyDB 콘솔로 돌아가 PSC 연결 요청을 **수락**합니다.
+4.  **DNS 이름으로 접속:** 반드시 할당된 IP가 아닌, 긴 **DNS 이름**을 사용하여 `psql -h [PSC_DNS_NAME] ...` 명령으로 접속해야 합니다.
+
+#### Q: GCE VM에 SSH 접속이 안 됩니다 (웹 브라우저, gcloud 모두 먹통).
+
+**A:** VPC의 방화벽 문제일 가능성이 99%입니다.
+1.  **SSH 허용 방화벽 규칙 생성:** Cloud Shell에서 아래 명령어를 실행하여 인터넷에서 VM으로의 SSH(TCP 포트 22) 접속을 허용하는 방화벽 규칙을 생성합니다. `[VPC_NETWORK_NAME]`을 `dev-vpc` 등으로 변경하세요.
+    ```bash
+    gcloud compute firewall-rules create default-allow-ssh \
+        --network=[VPC_NETWORK_NAME] \
+        --allow=tcp:22 \
+        --source-ranges=0.0.0.0/0
+    ```
+2.  **외부 IP 확인:** VM에 외부 IP가 할당되어 있는지 확인하세요. 없다면 VM을 수정하여 임시 외부 IP를 할당해야 합니다.
+
+#### Q: `gcloud run deploy` 실행 시 VPC 커넥터 오류가 발생합니다.
+
+**A:** 오류 메시지가 `VPC connector ... does not exist, or Cloud Run does not have permission to use it` 라면, 권한 문제입니다.
+1.  **커넥터 존재 확인:** `gcloud compute networks vpc-access connectors list --region asia-northeast3` 명령으로 커넥터가 `READY` 상태로 존재하는지 먼저 확인합니다.
+2.  **두 서비스 계정에 권한 부여:** **두 개의** 서비스 계정에 `roles/vpcaccess.user` 역할을 부여해야 합니다.
+    *   **사용자 지정 서비스 계정:**
+        ```bash
+        gcloud projects add-iam-policy-binding [YOUR_PROJECT_ID] \
+            --member="serviceAccount:[SERVICE_ACCOUNT_EMAIL]" \
+            --role="roles/vpcaccess.user"
+        ```
+    *   **Cloud Run 서비스 에이전트 (Google 관리):**
+        ```bash
+        gcloud projects add-iam-policy-binding [YOUR_PROJECT_ID] \
+            --member="serviceAccount:service-[YOUR_PROJECT_NUMBER]@serverless-robot-prod.iam.gserviceaccount.com" \
+            --role="roles/vpcaccess.user"
+        ```
+
+#### Q: `gcloud run deploy` 실행 중 `gcloud crashed (TypeError)` 오류가 발생합니다.
+
+**A:** `gcloud` 도구 자체의 문제 또는 빌드 환경의 네트워크 문제입니다.
+1.  **`gcloud` 업데이트:** `gcloud components update`를 실행하여 도구를 최신화합니다.
+2.  **`env.yaml` 사용:** 명령어에 직접 환경 변수를 주입하는 대신, 본문에 안내된 `env.yaml` 파일을 사용하는 `--env-vars-from-file` 방식으로 변경하세요. 이 방법이 훨씬 안정적입니다.
+3.  **Cloud Build 권한 확인:** IAM 페이지에서 `[PROJECT_NUMBER]@cloudbuild.gserviceaccount.com` 서비스 계정에 `Cloud Run 관리자` 및 `서비스 계정 사용자` 역할이 있는지 확인하세요.
