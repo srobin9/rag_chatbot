@@ -9,11 +9,14 @@ import sys # 상세한 traceback 로깅을 위해 추가
 import pandas as pd
 import pg8000.dbapi
 import vertexai
+import fitz  # PyMuPDF
 from flask import Flask, request
 from google.cloud import storage
-import fitz  # PyMuPDF
 
-# --- Vertex AI SDK 및 모델 클래스 임포트 (UPDATED) ---
+# api_core.client_options를 사용하기 위해 추가
+from google.api_core import client_options
+
+# --- Vertex AI SDK 및 모델 클래스 임포트 ---
 from vertexai.generative_models import GenerativeModel, Part, Tool, grounding
 from vertexai.language_models import TextEmbeddingModel
 from vertexai.vision_models import Image as VisionImage
@@ -56,9 +59,8 @@ GEMINI_PROMPT = """
 
 app = Flask(__name__)
 
-# --- 클라이언트 초기화를 담당하는 함수 ---
+# --- 클라이언트 초기화 함수 ---
 def init_clients():
-    # *** 중요: grounding_tool을 global 목록에 추가 ***
     global vertexai_initialized, gemini_model, text_embedding_model, multimodal_embedding_model, storage_client
 
     if vertexai_initialized:
@@ -66,24 +68,32 @@ def init_clients():
 
     print("Attempting to initialize clients...")
     try:
-        print(f"Initializing Vertex AI for project '{PROJECT_ID}' in region '{REGION}'")
-        vertexai.init(project=PROJECT_ID, location=REGION)
-        
-        print("Creating Google Search grounding tool...")
-        # *** grounding 모듈을 통해 GoogleSearchRetrieval 클래스에 접근합니다. ***
-        google_search_tool = Tool.from_google_search_retrieval(grounding.GoogleSearchRetrieval())
+        # 1. SDK를 특정 리전 없이 프로젝트만으로 기본 초기화
+        print(f"Initializing Vertex AI for project '{PROJECT_ID}'")
+        vertexai.init(project=PROJECT_ID)
 
-        print("Loading GenerativeModel 'gemini-2.5-pro' with grounding tool...")
+        # 2. Gemini 모델은 'us-central1'(글로벌 역할) 엔드포인트에서 초기화
+        print("Loading GenerativeModel 'gemini-2.5-pro' from 'us-central1'...")
+        gemini_client_options = client_options.ClientOptions(api_endpoint="us-central1-aiplatform.googleapis.com")
+        google_search_tool = Tool.from_google_search_retrieval(grounding.GoogleSearchRetrieval())
         gemini_model = GenerativeModel(
             "gemini-2.5-pro",
-            tools=[google_search_tool]
+            tools=[google_search_tool],
+            client_options=gemini_client_options
         )
 
-        print("Loading TextEmbeddingModel 'text-multilingual-embedding-002'...")
-        text_embedding_model = TextEmbeddingModel.from_pretrained("text-multilingual-embedding-002")
-
-        print("Loading MultiModalEmbeddingModel 'multimodalembedding@001'...")
-        multimodal_embedding_model = MultiModalEmbeddingModel.from_pretrained("multimodalembedding@001")
+        # 3. 임베딩 모델들은 원래 리전('asia-northeast3') 엔드포인트에서 초기화
+        print("Loading Embedding models from 'asia-northeast3'...")
+        embedding_client_options = client_options.ClientOptions(api_endpoint="asia-northeast3-aiplatform.googleapis.com")
+        
+        text_embedding_model = TextEmbeddingModel.from_pretrained(
+            "text-multilingual-embedding-002",
+            client_options=embedding_client_options
+        )
+        multimodal_embedding_model = MultiModalEmbeddingModel.from_pretrained(
+            "multimodalembedding@001",
+            client_options=embedding_client_options
+        )
         
         print("Initializing Google Cloud Storage client...")
         storage_client = storage.Client()
@@ -91,7 +101,6 @@ def init_clients():
         vertexai_initialized = True
         print("All clients initialized successfully.")
     except Exception as e:
-        # *** 중요: 초기화 실패 시 정확한 에러를 로깅하고 다시 예외를 발생시켜 앱 비정상 상태 방지 ***
         print(f"CRITICAL: Failed to initialize clients. Error: {e}", file=sys.stderr)
         traceback.print_exc()
         raise
@@ -210,7 +219,7 @@ def process_image(blob, conn):
                VALUES (%s, %s, %s, %s, %s)""",
             (f"gs://{blob.bucket.name}/{blob.name}", description, json.dumps(metadata_json, ensure_ascii=False), text_vector, multimodal_vector)
         )
-    finally
+    finally:
         cursor.close()
 
     print(f"Processed image {blob.name} with Grounding.")

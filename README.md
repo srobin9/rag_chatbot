@@ -23,7 +23,8 @@ gcloud services enable \
     cloudbuild.googleapis.com \
     logging.googleapis.com \
     monitoring.googleapis.com \
-    bigquery.googleapis.com
+    bigquery.googleapis.com \
+    dns.googleapis.com
 ```
 
 #### **2. AlloyDB for PostgreSQL 설정**
@@ -66,8 +67,8 @@ gcloud services enable \
             source_file VARCHAR(1024) NOT NULL,
             chunk_description TEXT,
             metadata JSONB,
-            text_embedding VECTOR(768),
-            multimodal_embedding VECTOR(1408),
+            text_embedding VECTOR(768),       -- text-multilingual-embedding-002 모델 기준
+            multimodal_embedding VECTOR(1408), -- multimodalembedding@001 모델 기준
             created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
         );
 
@@ -98,23 +99,48 @@ gcloud storage buckets notifications create gs://[YOUR_GCS_BUCKET_NAME] \
 
 ### **Phase 2: 데이터 수집 및 처리 서브시스템 (Data Ingestion & Processing)**
 
-이 단계에서는 GCS에 파일이 업로드되면 이를 감지하여 내용을 분석/추출/청킹하고, 벡터로 변환하여 AlloyDB에 저장하는 Cloud Run 서비스를 구현합니다.
+#### **1. Cloud Run 서비스 코드 준비 (주요 변경점 반영)**
 
-#### **1. Cloud Run 서비스 코드 준비**
+`main.py` 코드는 디버깅 과정에서 발견된 여러 문제를 해결한 최종 버전이어야 합니다. 핵심 변경사항은 다음과 같습니다.
 
-`~/rag_chatbot/data-ingestion/` 디렉토리의 `main.py` 및 `requirements.txt` 코드가 PSC를 통해 DB에 접속하도록 준비되었는지 확인합니다. 특히 `main.py`는 환경 변수(`DB_HOST`)를 사용하여 DB에 접속해야 합니다.
+*   **Vertex AI 초기화 (`init_clients` 함수):**
+    *   `gemini-2.5-pro` 모델은 특정 리전에 제한될 수 있으므로, **글로벌 엔드포인트**를 사용하도록 `location`을 명시해야 합니다.
+        ```python
+        # 'global' 위치를 사용하여 API를 초기화합니다.
+        vertexai.init(project=PROJECT_ID, location="global")
+        ```
+*   **Grounding 도구 생성 (`init_clients` 함수):**
+    *   `google-cloud-aiplatform` 라이브러리 버전에 따라 `Tool` 생성 방식이 변경되었습니다. 아래 방식이 안정적입니다.
+        ```python
+        from vertexai.generative_models import grounding # 모듈 임포트
 
-#### **2. 환경 변수 파일 생성**
+        # grounding 모듈을 통해 클래스에 접근하여 Tool 생성
+        google_search_tool = Tool.from_google_search_retrieval(grounding.GoogleSearchRetrieval())
+        
+        # 모델 생성 시 tools 인자로 전달
+        gemini_model = GenerativeModel("gemini-2.5-pro", tools=[google_search_tool])
+        ```
+*   **데이터베이스 커서 처리 (`process_*` 함수):**
+    *   `pg8000` 라이브러리의 커서는 `with` 구문을 지원하지 않습니다. `try...finally` 구문을 사용해야 합니다.
+        ```python
+        cursor = conn.cursor()
+        try:
+            # ... cursor.execute() 로직 ...
+        finally:
+            cursor.close()
+        ```
 
-명령어에 비밀번호 등 민감 정보를 직접 노출하는 것은 위험하며, 특수 문자(`!`, `$`)로 인한 오류를 유발합니다. `env.yaml` 파일을 생성하여 안전하게 환경 변수를 관리합니다.
+#### **2. 환경 변수 파일 생성 (`env.yaml`)**
 
 `~/rag_chatbot/data-ingestion/env.yaml` 파일을 아래 내용으로 생성하세요.
 
 ```yaml
+# REGION 변수는 더 이상 Vertex AI 초기화에 사용되지 않지만, 다른 목적으로 유지할 수 있습니다.
+GCP_PROJECT: "[YOUR_PROJECT_ID]" # 이 라인을 추가하세요.
 REGION: "asia-northeast3"
-DB_HOST: "[PSC_DNS_NAME]"  # 1단계에서 확인한 AlloyDB의 PSC DNS 이름
+DB_HOST: "[PSC_DNS_NAME]"
 DB_USER: "postgres"
-DB_PASS: "[YOUR_DB_PASSWORD]" # 비밀번호에 특수문자가 있어도 그대로 입력
+DB_PASS: "[YOUR_DB_PASSWORD]"
 DB_NAME: "document_embeddings"
 ```
 
@@ -137,7 +163,7 @@ gcloud run deploy file-processor-service \
     --memory=2Gi
 ```
 
-*   **`[VPC_CONNECTOR_IN_asia-northeast3]`**: Cloud Run과 **동일한 리전 및 VPC**에 생성된 서버리스 VPC 액세스 커넥터의 이름입니다.
+*   **`[VPC_CONNECTOR]`**: Cloud Run과 **동일한 리전 및 VPC**에 생성된 서버리스 VPC 액세스 커넥터의 이름입니다.
 *   **`[SERVICE_ACCOUNT_EMAIL]`**: 배포에 사용할 서비스 계정입니다. 이 계정은 다음 권한을 필수로 가집니다.
     *   Vertex AI 사용자 (`roles/aiplatform.user`)
     *   Storage 객체 뷰어 (`roles/storage.objectViewer`)
@@ -158,7 +184,125 @@ gcloud pubsub subscriptions create gcs-file-event-subscription \
 
 ---
 
-### **Phase 3: 서빙 서브시스템 (Serving Subsystem)**
+### **Phase 3: 백필(Backfill) 및 재처리 테스트**
+
+`file-processor-service`의 코드를 수정했거나, 특정 파일 처리가 누락/실패했을 때, GCS에 파일을 다시 업로드하지 않고도 기존 파일들을 재처리할 수 있습니다. `backfill.py` 스크립트는 GCS 버킷의 특정 폴더에 있는 모든 파일 목록을 읽어, 각 파일에 대해 GCS 업로드 이벤트(Pub/Sub 메시지)를 수동으로 생성하여 파이프라인을 트리거합니다.
+
+이 과정은 로컬 PC 또는 Cloud Shell에서 Python 가상 환경을 설정하여 안전하게 실행합니다.
+
+#### **1. 백필 스크립트 준비 (`backfill.py`)**
+
+먼저 `~/rag_chatbot/backfill/` 디렉토리에 필요한 파일들이 있는지 확인합니다.
+
+**`requirements.txt`**
+이 디렉토리에는 Python 라이브러리 의존성을 정의한 `requirements.txt` 파일이 있어야 합니다.
+
+```txt
+google-cloud-storage
+google-cloud-pubsub
+```
+
+**`backfill.py`**
+스크립트는 GCS와 Pub/Sub 클라이언트를 사용하여 메시지를 발행하는 로직을 포함해야 합니다. (아래는 기능 이해를 돕기 위한 예시 코드)
+
+```python
+import argparse
+import json
+from google.cloud import storage, pubsub_v1
+
+def trigger_gcs_events(project_id, topic_id, gcs_bucket, gcs_prefix):
+    """Lists files in GCS and publishes a Pub/Sub message for each."""
+    
+    storage_client = storage.Client(project=project_id)
+    publisher = pubsub_v1.PublisherClient()
+    topic_path = publisher.topic_path(project_id, topic_id)
+
+    blobs = storage_client.list_blobs(gcs_bucket, prefix=gcs_prefix)
+    
+    print(f"Found files in gs://{gcs_bucket}/{gcs_prefix}. Publishing events to topic '{topic_id}'...")
+    
+    for blob in blobs:
+        # GCS OBJECT_FINALIZE 이벤트와 유사한 메시지 구조 생성
+        message_data = {
+            "bucket": gcs_bucket,
+            "name": blob.name
+        }
+        
+        # 데이터를 JSON 문자열로 변환 후, 바이트로 인코딩
+        message_bytes = json.dumps(message_data).encode("utf-8")
+        
+        future = publisher.publish(topic_path, data=message_bytes)
+        print(f"Published message for gs://{gcs_bucket}/{blob.name}, message_id: {future.result()}")
+
+    print("Backfill process completed.")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="GCS backfill script for Pub/Sub.")
+    parser.add_argument("--project_id", required=True, help="Your Google Cloud project ID.")
+    parser.add_argument("--topic_id", required=True, help="The Pub/Sub topic ID to publish to.")
+    parser.add_argument("--gcs_bucket", required=True, help="The GCS bucket name.")
+    parser.add_argument("--gcs_prefix", default="", help="Optional GCS path prefix to filter files.")
+    
+    args = parser.parse_args()
+    
+    trigger_gcs_events(args.project_id, args.topic_id, args.gcs_bucket, args.gcs_prefix)
+```
+
+#### **2. 로컬/Cloud Shell 환경 설정 및 실행**
+
+1.  **디렉토리 이동:**
+    Cloud Shell 또는 로컬 터미널에서 `backfill.py`가 있는 곳으로 이동합니다.
+    ```bash
+    cd ~/rag_chatbot/backfill
+    ```
+
+2.  **Python 가상 환경 생성 및 활성화:**
+    프로젝트별로 독립된 라이브러리 환경을 사용하기 위해 가상 환경을 생성합니다.
+    ```bash
+    # 가상 환경 'venv' 생성
+    python3 -m venv venv
+
+    # 가상 환경 활성화 (터미널 프롬프트 앞에 '(venv)'가 나타남)
+    source venv/bin/activate
+    ```
+
+3.  **필요 라이브러리 설치:**
+    가상 환경이 **반드시 활성화된 상태**에서 `requirements.txt` 파일로 라이브러리를 설치합니다.
+    ```bash
+    pip install -r requirements.txt
+    ```
+
+4.  **GCP 인증:**
+    스크립트가 GCP 서비스(GCS, Pub/Sub)에 접근할 수 있도록 로컬 환경에서 사용자 계정으로 인증합니다.
+    ```bash
+    gcloud auth application-default login
+    ```
+    이 명령어는 웹 브라우저를 열어 Google 계정으로 로그인하도록 요청하며, 인증 정보를 로컬에 저장합니다.
+
+5.  **백필 스크립트 실행:**
+    이제 모든 준비가 끝났습니다. 아래 명령어를 실행하여 백필을 시작합니다. `[PLACEHOLDER]` 부분들을 실제 값으로 변경하세요.
+    ```bash
+    python backfill.py \
+        --project_id [YOUR_PROJECT_ID] \
+        --gcs_bucket [YOUR_GCS_BUCKET_NAME] \
+        --gcs_prefix pdfs/ \
+        --topic_id gcs-file-events
+    ```
+
+#### **3. 결과 모니터링**
+
+스크립트가 실행되면 터미널에 각 파일에 대한 메시지 발행 로그가 출력됩니다. 이와 동시에, **Cloud Run 콘솔의 로그 탐색기**로 이동하여 `file-processor-service`의 로그를 확인하세요. GCS의 각 파일에 대해 서비스가 순차적으로 트리거되며 처리 로그가 나타나는 것을 볼 수 있습니다. 이를 통해 전체 데이터 처리 파이프라인이 정상적으로 작동하는지 검증할 수 있습니다.
+
+#### **4. 가상 환경 비활성화**
+
+테스트가 끝나면 아래 명령어로 가상 환경을 빠져나옵니다.
+```bash
+deactivate
+```
+
+---
+
+### **Phase 4: 서빙 서브시스템 (Serving Subsystem)**
 
 이제 AlloyDB에 저장된 벡터 데이터를 활용하여 사용자 질문에 답변하는 챗봇 에이전트를 구성합니다. 다이어그램의 `Google AgentSpace`는 **Vertex AI Agent Builder** (과거 Gen App Builder)를 의미하는 것으로 보입니다.
 
@@ -176,7 +320,7 @@ gcloud pubsub subscriptions create gcs-file-event-subscription \
 
 ---
 
-### **Phase 4: 품질 평가 서브시스템 (Quality Evaluation)**
+### **Phase 5: 품질 평가 서브시스템 (Quality Evaluation)**
 
 이 시스템은 생성된 답변의 품질을 자동으로 평가하고 결과를 BigQuery에 저장하는 역할을 합니다.
 
@@ -330,3 +474,21 @@ CREATE OR REPLACE TABLE `[YOUR_PROJECT_ID].[YOUR_DATASET_ID].evaluation_results`
 1.  **`gcloud` 업데이트:** `gcloud components update`를 실행하여 도구를 최신화합니다.
 2.  **`env.yaml` 사용:** 명령어에 직접 환경 변수를 주입하는 대신, 본문에 안내된 `env.yaml` 파일을 사용하는 `--env-vars-from-file` 방식으로 변경하세요. 이 방법이 훨씬 안정적입니다.
 3.  **Cloud Build 권한 확인:** IAM 페이지에서 `[PROJECT_NUMBER]@cloudbuild.gserviceaccount.com` 서비스 계정에 `Cloud Run 관리자` 및 `서비스 계정 사용자` 역할이 있는지 확인하세요.
+
+#### Q: Cloud Run 로그에 `Name or service not known` 또는 `Can't create a connection to host` 오류가 발생합니다.
+
+**A:** Cloud Run이 AlloyDB의 PSC DNS 주소를 IP로 변환하지 못하는, 전형적인 **비공개 DNS 조회 문제**입니다.
+1.  **가장 먼저 [Phase 1의 3단계](#3-가장-중요-psc용-비공개-dns-영역private-dns-zone-설정)를 수행했는지 확인하세요.** `goog` DNS 이름으로 비공개 DNS 영역을 만들고, VPC 네트워크에 연결한 후, PSC의 전체 DNS 이름과 IP 주소로 A 레코드를 추가해야 합니다.
+2.  Cloud DNS API(`dns.googleapis.com`)가 활성화되어 있는지 확인하세요.
+
+#### Q: Cloud Run 로그에 `404 Not Found ... models/gemini-2.5-pro` 오류가 발생합니다.
+
+**A:** API를 호출한 리전(`asia-northeast3`)에 해당 모델이 없기 때문입니다.
+1.  `main.py`의 `init_clients` 함수에서 `vertexai.init(location="global")`로 설정하여 **글로벌 엔드포인트**를 사용하도록 수정하세요.
+
+#### Q: `gcloud run deploy` 실행 시 VPC 커넥터 오류가 발생합니다.
+
+**A:** 오류 메시지가 `VPC connector ... does not exist, or Cloud Run does not have permission to use it` 라면, 권한 문제입니다.
+1.  **두 개의** 서비스 계정에 `roles/vpcaccess.user` 역할을 부여해야 합니다.
+    *   **배포에 사용한 서비스 계정:** `[SERVICE_ACCOUNT_EMAIL]`
+    *   **Cloud Run 서비스 에이전트:** `service-[YOUR_PROJECT_NUMBER]@serverless-robot-prod.iam.gserviceaccount.com`
