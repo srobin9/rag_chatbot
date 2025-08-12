@@ -122,10 +122,10 @@ cd ~/rag_chatbot/data-ingestion
 gcloud run deploy file-processor-service \
     --source . \
     --platform managed \
-    --region asia-northeast3 \
+    --region [REGION] \
     --allow-unauthenticated \
-    --vpc-connector [VPC_CONNECTOR_IN_asia-northeast3] \
-    --env-vars-from-file=env.yaml \
+    --vpc-connector [VPC_CONNECTOR] \
+    --env-vars-file=env.yaml \
     --service-account [SERVICE_ACCOUNT_EMAIL]
 ```
 

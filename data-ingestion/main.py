@@ -8,7 +8,7 @@ import ssl
 import pandas as pd
 import vertexai
 from flask import Flask, request
-# from google.cloud import alloydb, storage
+from google.cloud import alloydb, storage
 from PIL import Image
 from pypdf import PdfReader
 from vertexai.vision_models import Image as VisionImage
