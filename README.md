@@ -57,17 +57,22 @@ gcloud services enable \
         -- pgvector 확장 기능 활성화
         CREATE EXTENSION IF NOT EXISTS vector;
 
+        -- 기존 테이블이 있다면 삭제합니다.
+        DROP TABLE IF EXISTS document_embeddings;
+
         -- 벡터 데이터와 메타데이터를 저장할 테이블 생성
         CREATE TABLE document_embeddings (
             id SERIAL PRIMARY KEY,
-            source_file VARCHAR(1024),
-            chunk_description TEXT, -- 이 청크가 무엇에 대한 것인지 설명 (예: "3페이지의 아키텍처 다이어그램")
-            embedding VECTOR(1408) -- multimodalembedding@001 모델의 차원 수
+            source_file VARCHAR(1024) NOT NULL,
+            chunk_description TEXT,
+            metadata JSONB,
+            text_embedding VECTOR(768),
+            multimodal_embedding VECTOR(1408),
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
         );
 
-        -- 벡터 검색 속도를 높이기 위한 HNSW 인덱스 생성 (선택 사항이지만 강력히 권장)
-        CREATE INDEX ON document_embeddings
-        USING hnsw (embedding vector_l2_ops);
+        CREATE INDEX ON document_embeddings USING hnsw (text_embedding vector_l2_ops);
+        CREATE INDEX ON document_embeddings USING hnsw (multimodal_embedding vector_l2_ops);
     ```
 
 #### **3. Pub/Sub 토픽 생성**
@@ -126,6 +131,7 @@ gcloud run deploy file-processor-service \
     --region [REGION] \
     --allow-unauthenticated \
     --vpc-connector [VPC_CONNECTOR] \
+    --vpc-egress=all-traffic \
     --env-vars-file=env.yaml \
     --service-account [SERVICE_ACCOUNT_EMAIL] \
     --memory=2Gi
