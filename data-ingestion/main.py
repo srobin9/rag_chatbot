@@ -130,7 +130,8 @@ def process_pdf(blob, conn):
     pdf_bytes = blob.download_as_bytes()
     pdf_document = fitz.open(stream=pdf_bytes, filetype="pdf")
     
-    with conn.cursor() as cursor:
+    cursor = conn.cursor()
+    try:
         for i, page in enumerate(pdf_document):
             page_text = page.get_text().strip()
             pix = page.get_pixmap(dpi=150)
@@ -168,6 +169,9 @@ def process_pdf(blob, conn):
                    VALUES (%s, %s, %s, %s, %s)""",
                 (f"gs://{blob.bucket.name}/{blob.name}", description, json.dumps(metadata_json, ensure_ascii=False), text_vector, multimodal_vector)
             )
+    finally:
+        cursor.close()
+
     print(f"Processed {pdf_document.page_count} pages from {blob.name} with Grounding.")
 
 
@@ -175,7 +179,8 @@ def process_image(blob, conn):
     """Grounding을 포함한 하이브리드 전략으로 이미지 처리"""
     image_bytes = blob.download_as_bytes()
     
-    with conn.cursor() as cursor:
+    cursor = conn.cursor()
+    try:
         # --- 1. Gemini 2.5 Pro로 메타데이터 추출 (Grounding 사용) ---
         response = gemini_model.generate_content(
             [GEMINI_PROMPT, Part.from_data(image_bytes, mime_type="image/png")]
@@ -205,6 +210,9 @@ def process_image(blob, conn):
                VALUES (%s, %s, %s, %s, %s)""",
             (f"gs://{blob.bucket.name}/{blob.name}", description, json.dumps(metadata_json, ensure_ascii=False), text_vector, multimodal_vector)
         )
+    finally
+        cursor.close()
+
     print(f"Processed image {blob.name} with Grounding.")
 
 
@@ -213,7 +221,8 @@ def process_excel(blob, conn):
     excel_bytes = blob.download_as_bytes()
     xls = pd.ExcelFile(io.BytesIO(excel_bytes))
     
-    with conn.cursor() as cursor:
+    cursor = conn.cursor()
+    try:
         for sheet_name in xls.sheet_names:
             df = pd.read_excel(xls, sheet_name=sheet_name, header=None).fillna('')
             for i in range(0, len(df), 20): # 20행씩 청킹
@@ -249,6 +258,9 @@ def process_excel(blob, conn):
                        VALUES (%s, %s, %s, %s, %s)""",
                     (f"gs://{blob.bucket.name}/{blob.name}", description, json.dumps(metadata_json, ensure_ascii=False), text_vector, multimodal_vector)
                 )
+    finally:
+        cursor.close()
+
     print(f"Processed sheets {xls.sheet_names} from {blob.name} with Grounding.")
 
 # --- Flask 라우트 (상세 로깅 및 에러 핸들링 강화) ---
