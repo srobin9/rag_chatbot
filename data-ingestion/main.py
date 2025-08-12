@@ -18,7 +18,6 @@ from vertexai.generative_models import GenerativeModel, Part, Tool
 from vertexai.language_models import TextEmbeddingModel
 from vertexai.vision_models import Image as VisionImage
 from vertexai.vision_models import MultiModalEmbeddingModel
-from vertexai.preview import grounding
 
 # --- 환경 변수 및 클라이언트 초기화 ---
 DB_HOST = os.environ.get("DB_HOST")
@@ -60,8 +59,8 @@ app = Flask(__name__)
 # --- 클라이언트 초기화를 담당하는 함수 ---
 def init_clients():
     # *** 중요: grounding_tool을 global 목록에 추가 ***
-    global vertexai_initialized, gemini_model, text_embedding_model, multimodal_embedding_model, storage_client, grounding_tool
-    
+    global vertexai_initialized, gemini_model, text_embedding_model, multimodal_embedding_model, storage_client
+
     if vertexai_initialized:
         return
 
@@ -70,8 +69,16 @@ def init_clients():
         print(f"Initializing Vertex AI for project '{PROJECT_ID}' in region '{REGION}'")
         vertexai.init(project=PROJECT_ID, location=REGION)
         
-        print("Loading GenerativeModel 'gemini-2.5-pro'...")
-        gemini_model = GenerativeModel("gemini-2.5-pro")
+        print("Creating Google Search grounding tool...")
+        # 1. Google Search를 위한 Tool 객체를 직접 만듭니다.
+        google_search_tool = Tool.from_google_search_retrieval()
+
+        print("Loading GenerativeModel 'gemini-2.5-pro' with grounding tool...")
+        # 2. 모델을 생성할 때 tools 인자로 전달합니다.
+        gemini_model = GenerativeModel(
+            "gemini-2.5-pro",
+            tools=[google_search_tool]
+        )
 
         print("Loading TextEmbeddingModel 'text-multilingual-embedding-002'...")
         text_embedding_model = TextEmbeddingModel.from_pretrained("text-multilingual-embedding-002")
@@ -79,9 +86,6 @@ def init_clients():
         print("Loading MultiModalEmbeddingModel 'multimodalembedding@001'...")
         multimodal_embedding_model = MultiModalEmbeddingModel.from_pretrained("multimodalembedding@001")
         
-        print("Creating Google Search grounding tool...")
-        grounding_tool = Tool.from_google_search_retrieval(grounding.GoogleSearchRetrieval())
-
         print("Initializing Google Cloud Storage client...")
         storage_client = storage.Client()
        
@@ -135,8 +139,7 @@ def process_pdf(blob, conn):
             
             # --- 1. Gemini 2.5 Pro로 메타데이터 추출 (Grounding 사용) ---
             response = gemini_model.generate_content(
-                [GEMINI_PROMPT, Part.from_data(image_bytes, mime_type="image/png"), page_text],
-                tools=[grounding_tool]
+                [GEMINI_PROMPT, Part.from_data(image_bytes, mime_type="image/png"), page_text]
             )
             metadata_json = get_json_from_gemini_response(response)
             
@@ -176,8 +179,7 @@ def process_image(blob, conn):
     with conn.cursor() as cursor:
         # --- 1. Gemini 2.5 Pro로 메타데이터 추출 (Grounding 사용) ---
         response = gemini_model.generate_content(
-            [GEMINI_PROMPT, Part.from_data(image_bytes, mime_type="image/png")],
-            tools=[grounding_tool]
+            [GEMINI_PROMPT, Part.from_data(image_bytes, mime_type="image/png")]
         )
         metadata_json = get_json_from_gemini_response(response)
         
@@ -222,7 +224,7 @@ def process_excel(blob, conn):
 
                 # --- 1. Gemini 2.5 Pro로 메타데이터 추출 (Grounding 사용) ---
                 response = gemini_model.generate_content(
-                    [GEMINI_PROMPT, chunk_text], tools=[grounding_tool]
+                    [GEMINI_PROMPT, chunk_text]
                 )
                 metadata_json = get_json_from_gemini_response(response)
 
