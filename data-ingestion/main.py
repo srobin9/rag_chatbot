@@ -14,7 +14,7 @@ from google.cloud import storage
 import fitz  # PyMuPDF
 
 # --- Vertex AI SDK 및 모델 클래스 임포트 (UPDATED) ---
-from vertexai.generative_models import GenerativeModel, Part, Tool
+from vertexai.generative_models import GenerativeModel, Part, Tool, grounding
 from vertexai.language_models import TextEmbeddingModel
 from vertexai.vision_models import Image as VisionImage
 from vertexai.vision_models import MultiModalEmbeddingModel
@@ -70,11 +70,10 @@ def init_clients():
         vertexai.init(project=PROJECT_ID, location=REGION)
         
         print("Creating Google Search grounding tool...")
-        # 1. Google Search를 위한 Tool 객체를 직접 만듭니다.
-        google_search_tool = Tool.from_google_search_retrieval()
+        # *** grounding 모듈을 통해 GoogleSearchRetrieval 클래스에 접근합니다. ***
+        google_search_tool = Tool.from_google_search_retrieval(grounding.GoogleSearchRetrieval())
 
         print("Loading GenerativeModel 'gemini-2.5-pro' with grounding tool...")
-        # 2. 모델을 생성할 때 tools 인자로 전달합니다.
         gemini_model = GenerativeModel(
             "gemini-2.5-pro",
             tools=[google_search_tool]
