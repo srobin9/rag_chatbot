@@ -40,7 +40,11 @@ gcloud services enable \
     *   **[중요]** 만약 조직 정책 오류로 수락이 불가능하다면, [트러블슈팅](#q-alloydb-psc-엔드포인트-연결-수락이-실패합니다) 섹션을 참조하세요.
     *   수락이 완료되면 엔드포인트 상태가 **`✅ 수락됨`**으로 바뀌고, 내부 IP와 **DNS 이름**이 할당됩니다. 이 DNS 이름을 다음 단계에서 사용합니다.
 
-3.  **데이터베이스 접속 및 생성:**
+3.  **PSC용 비공개 DNS 영역(Private DNS Zone) 설정**
+    *   이 단계가 누락되면 Cloud Run에서 **`Name or service not known`** 오류가 발생합니다.
+    *   `goog` DNS 이름으로 비공개 영역을 만들고 VPC에 연결한 후, PSC의 전체 DNS 이름과 IP 주소로 **A 레코드**를 추가해야 합니다.
+
+4.  **데이터베이스 접속 및 생성:**
     *   AlloyDB는 VPC 내부에 있으므로, **동일한 VPC에 연결된 GCE VM**을 통해 접속해야 합니다.
     *   GCE VM에 SSH로 접속한 후, 아래 명령어로 `psql` 클라이언트를 사용하여 접속합니다. `[PSC_DNS_NAME]`을 위에서 확인한 DNS 이름으로 변경하세요.
         ```bash
@@ -52,7 +56,7 @@ gcloud services enable \
         CREATE DATABASE document_embeddings;
         ```
 
-4.  **`pgvector` 확장 활성화 및 테이블 생성:**
+5.  **`pgvector` 확장 활성화 및 테이블 생성:**
     *   새로 만든 데이터베이스에 다시 접속(`\c document_embeddings`)한 후, 다음 SQL 쿼리를 실행합니다.
         ```sql
         -- pgvector 확장 기능 활성화
@@ -99,45 +103,79 @@ gcloud storage buckets notifications create gs://[YOUR_GCS_BUCKET_NAME] \
 
 ### **Phase 2: 데이터 수집 및 처리 서브시스템 (Data Ingestion & Processing)**
 
-#### **1. Cloud Run 서비스 코드 준비 (주요 변경점 반영)**
+#### **1. 서비스 코드 및 의존성 준비**
 
-`main.py` 코드는 디버깅 과정에서 발견된 여러 문제를 해결한 최종 버전이어야 합니다. 핵심 변경사항은 다음과 같습니다.
+**`requirements.txt` 파일 준비**
 
-*   **Vertex AI 초기화 (`init_clients` 함수):**
-    *   `gemini-2.5-pro` 모델은 특정 리전에 제한될 수 있으므로, **글로벌 엔드포인트**를 사용하도록 `location`을 명시해야 합니다.
-        ```python
-        # 'global' 위치를 사용하여 API를 초기화합니다.
-        vertexai.init(project=PROJECT_ID, location="global")
-        ```
-*   **Grounding 도구 생성 (`init_clients` 함수):**
-    *   `google-cloud-aiplatform` 라이브러리 버전에 따라 `Tool` 생성 방식이 변경되었습니다. 아래 방식이 안정적입니다.
-        ```python
-        from vertexai.generative_models import grounding # 모듈 임포트
+가장 먼저 `main.py`가 위치한 디렉토리에 `requirements.txt` 파일을 생성하고, 서비스에 필요한 라이브러리와 **최신 Vertex AI SDK 버전**을 명시적으로 지정해야 합니다. SDK 버전이 낮으면 `client_options` 같은 중요 파라미터를 인식하지 못해 `TypeError`가 발생합니다.
 
-        # grounding 모듈을 통해 클래스에 접근하여 Tool 생성
-        google_search_tool = Tool.from_google_search_retrieval(grounding.GoogleSearchRetrieval())
-        
-        # 모델 생성 시 tools 인자로 전달
-        gemini_model = GenerativeModel("gemini-2.5-pro", tools=[google_search_tool])
-        ```
-*   **데이터베이스 커서 처리 (`process_*` 함수):**
-    *   `pg8000` 라이브러리의 커서는 `with` 구문을 지원하지 않습니다. `try...finally` 구문을 사용해야 합니다.
-        ```python
-        cursor = conn.cursor()
+`~/rag_chatbot/data-ingestion/requirements.txt`
+```txt
+# 웹 프레임워크
+Flask==3.0.0
+gunicorn==21.2.0
+
+# GCP 및 데이터베이스
+google-cloud-storage>=2.14.0
+# [중요] 최신 Vertex AI 기능을 사용하기 위해 버전을 명시적으로 지정합니다.
+google-cloud-aiplatform>=1.55.0
+pg8000>=1.30.0
+
+# 데이터 처리
+pandas>=2.0.0
+openpyxl>=3.1.0
+PyMuPDF # fitz 모듈 제공
+Pillow>=10.0.0
+```
+
+**`main.py` 코드 준비 (최종 아키텍처 반영)**
+
+`main.py` 코드는 여러 모델이 각기 다른 최적의 API 엔드포인트에 존재한다는 사실을 반영해야 합니다. `ClientOptions`를 사용하여 각 모델을 초기화할 때 명시적으로 엔드포인트를 지정하는 것이 가장 안정적인 방법입니다.
+
+*   **핵심 원리:**
+    *   `gemini-2.5-pro`와 같은 최신 LLM은 `us-central1` 리전에서 가장 먼저 제공되며, 사실상의 글로벌 엔드포인트 역할을 합니다.
+    *   `text-multilingual-embedding-002`와 같은 임베딩 모델은 `asia-northeast3`를 포함한 여러 리전에서 안정적으로 제공됩니다.
+    *   따라서 각 모델을 **자신이 존재하는 올바른 엔드포인트 주소**로 직접 호출해야 합니다.
+
+*   **`main.py`의 `init_clients` 함수 수정 예시:**
+    ```python
+    # ClientOptions를 사용하기 위해 추가
+    from google.api_core import client_options
+    # ... 다른 import 구문
+
+    def init_clients():
+        # ...
         try:
-            # ... cursor.execute() 로직 ...
-        finally:
-            cursor.close()
-        ```
+            # 1. SDK를 특정 리전 없이 프로젝트만으로 기본 초기화
+            vertexai.init(project=PROJECT_ID)
+
+            # 2. Gemini 모델은 'us-central1' 엔드포인트에서 초기화
+            gemini_client_options = client_options.ClientOptions(api_endpoint="us-central1-aiplatform.googleapis.com")
+            google_search_tool = Tool.from_google_search_retrieval(grounding.GoogleSearchRetrieval())
+            gemini_model = GenerativeModel(
+                "gemini-2.5-pro",
+                tools=[google_search_tool],
+                client_options=gemini_client_options
+            )
+
+            # 3. 임베딩 모델들은 원래 리전('asia-northeast3') 엔드포인트에서 초기화
+            embedding_client_options = client_options.ClientOptions(api_endpoint="asia-northeast3-aiplatform.googleapis.com")
+            text_embedding_model = TextEmbeddingModel.from_pretrained(
+                "text-multilingual-embedding-002",
+                client_options=embedding_client_options
+            )
+            # ... 다른 모델도 동일하게 client_options 적용 ...
+        # ...
+    ```
 
 #### **2. 환경 변수 파일 생성 (`env.yaml`)**
 
-`~/rag_chatbot/data-ingestion/env.yaml` 파일을 아래 내용으로 생성하세요.
+`GCP_PROJECT`는 Cloud Run의 기본 환경변수가 아니므로, **반드시 명시적으로 추가해야 합니다.**
 
+`~/rag_chatbot/data-ingestion/env.yaml` 파일을 아래 내용으로 생성하세요.
 ```yaml
-# REGION 변수는 더 이상 Vertex AI 초기화에 사용되지 않지만, 다른 목적으로 유지할 수 있습니다.
-GCP_PROJECT: "[YOUR_PROJECT_ID]" # 이 라인을 추가하세요.
-REGION: "asia-northeast3"
+GCP_PROJECT: "[YOUR_PROJECT_ID]"  # [필수] SDK가 프로젝트를 인식하도록 명시적으로 추가
+REGION: "asia-northeast3"         # 임베딩 모델 등을 위한 리전 정보
 DB_HOST: "[PSC_DNS_NAME]"
 DB_USER: "postgres"
 DB_PASS: "[YOUR_DB_PASSWORD]"
@@ -492,3 +530,22 @@ CREATE OR REPLACE TABLE `[YOUR_PROJECT_ID].[YOUR_DATASET_ID].evaluation_results`
 1.  **두 개의** 서비스 계정에 `roles/vpcaccess.user` 역할을 부여해야 합니다.
     *   **배포에 사용한 서비스 계정:** `[SERVICE_ACCOUNT_EMAIL]`
     *   **Cloud Run 서비스 에이전트:** `service-[YOUR_PROJECT_NUMBER]@serverless-robot-prod.iam.gserviceaccount.com`
+
+#### Q: Cloud Run 로그에 `404 Not Found ... Publisher Model ... is not found` 오류가 발생합니다.
+
+**A:** API를 호출한 엔드포인트에 해당 모델이 존재하지 않기 때문입니다. 이는 **모든 모델이 동일한 리전(`asia-northeast3`)이나 `global` 엔드포인트에 있지 않기 때문**에 발생합니다.
+1.  **해결책:** `main.py`의 `init_clients` 함수에서, 각 모델을 생성할 때 `client_options`를 사용하여 올바른 API 엔드포인트를 명시적으로 지정해야 합니다.
+2.  **예시:**
+    *   `gemini-2.5-pro` -> `api_endpoint="us-central1-aiplatform.googleapis.com"`
+    *   `text-multilingual-embedding-002` -> `api_endpoint="asia-northeast3-aiplatform.googleapis.com"`
+3.  자세한 코드는 **[Phase 2의 1단계](#1-cloud-run-서비스-코드-준비-최종-아키텍처-반영)**를 참조하세요.
+
+#### Q: Cloud Run 로그에 `Initializing Vertex AI for project 'None'...`가 보이며, 이후 404 오류가 발생합니다.
+
+**A:** Cloud Run 환경에 `GCP_PROJECT` 환경 변수가 설정되지 않아 SDK가 어떤 프로젝트로 API를 호출해야 할지 모르기 때문입니다.
+1.  **해결책:** `env.yaml` 파일에 `GCP_PROJECT: "[YOUR_PROJECT_ID]"` 한 줄을 **반드시 추가**한 후, 다시 배포하세요.
+
+#### Q: Cloud Run 로그에 `Name or service not known` 또는 `Can't create a connection to host` 오류가 발생합니다.
+
+**A:** Cloud Run이 AlloyDB의 PSC DNS 주소를 IP로 변환하지 못하는, 전형적인 **비공개 DNS 조회 문제**입니다.
+1.  **해결책:** **[Phase 1의 2단계](#2-alloydb-for-postgresql-설정)**에 있는 **PSC용 비공개 DNS 영역 설정** 가이드를 다시 한번 꼼꼼히 확인하고 그대로 실행하세요. `goog` DNS 이름으로 비공개 영역을 만들고 VPC에 연결한 후, A 레코드를 추가해야 합니다.

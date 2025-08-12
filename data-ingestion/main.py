@@ -17,10 +17,18 @@ from google.cloud import storage
 from google.api_core import client_options
 
 # --- Vertex AI SDK 및 모델 클래스 임포트 ---
-from vertexai.generative_models import GenerativeModel, Part, Tool, grounding
+from vertexai.generative_models import GenerativeModel, Part
 from vertexai.language_models import TextEmbeddingModel
 from vertexai.vision_models import Image as VisionImage
 from vertexai.vision_models import MultiModalEmbeddingModel
+
+from google import genai
+from google.genai.types import (
+    GenerateContentConfig,
+    GoogleSearch,
+    HttpOptions,
+    Tool,
+)
 
 # --- 환경 변수 및 클라이언트 초기화 ---
 DB_HOST = os.environ.get("DB_HOST")
@@ -45,21 +53,21 @@ ssl_context.verify_mode = ssl.CERT_NONE
 
 # --- 프롬프트 정의 ---
 # Grounding을 활용하도록 프롬프트를 좀 더 구체화할 수 있습니다.
-GEMINI_PROMPT = """
-당신은 문서를 분석하여 구조화된 JSON으로 만드는 전문가입니다.
-주어진 문서 청크(이미지와 텍스트)를 분석하고, 필요하다면 웹 검색을 통해 최신 정보를 확인하여 아래 지침에 따라 JSON 형식으로 결과를 반환해 주세요.
-
-1.  **summary**: 문서 청크의 핵심 내용을 한국어로 명확하고 간결하게 요약합니다. 문서에 언급된 특정 용어, 인물, 회사에 대한 최신 정보가 필요하면 웹을 참조하여 요약에 반영하세요.
-2.  **extracted_entities**: 문서에서 발견된 중요한 개체(날짜, 사람, 회사, 금액, 기술 용어 등)를 추출합니다.
-3.  **document_type**: 이 청크를 기반으로 문서의 유형(예: 계약서, 최신 기술 보고서, 금융 분석, 뉴스 기사, 다이어그램)을 추정합니다.
-4.  **keywords**: 내용의 핵심 키워드를 5개 이내로 추출합니다.
-
-모든 응답은 다른 설명 없이 오직 JSON 객체만 포함해야 합니다.
-"""
+#GEMINI_PROMPT = """
+#당신은 문서를 분석하여 구조화된 JSON으로 만드는 전문가입니다.
+#주어진 문서 청크(이미지와 텍스트)를 분석하고, 필요하다면 웹 검색을 통해 최신 정보를 확인하여 아래 지침에 따라 JSON 형식으로 결과를 반환해 주세요.
+#
+#1.  **summary**: 문서 청크의 핵심 내용을 한국어로 명확하고 간결하게 요약합니다. 문서에 언급된 특정 용어, 인물, 회사에 대한 최신 정보가 필요하면 웹을 참조하여 요약에 반영하세요.
+#2.  **extracted_entities**: 문서에서 발견된 중요한 개체(날짜, 사람, 회사, 금액, 기술 용어 등)를 추출합니다.
+#3.  **document_type**: 이 청크를 기반으로 문서의 유형(예: 계약서, 최신 기술 보고서, 금융 분석, 뉴스 기사, 다이어그램)을 추정합니다.
+#4.  **keywords**: 내용의 핵심 키워드를 5개 이내로 추출합니다.
+#
+#모든 응답은 다른 설명 없이 오직 JSON 객체만 포함해야 합니다.
+#"""
 
 app = Flask(__name__)
 
-# --- 클라이언트 초기화 함수 ---
+# --- 클라이언트 초기화 함수 (최종 수정본) ---
 def init_clients():
     global vertexai_initialized, gemini_model, text_embedding_model, multimodal_embedding_model, storage_client
 
@@ -68,36 +76,40 @@ def init_clients():
 
     print("Attempting to initialize clients...")
     try:
-        # 1. SDK를 특정 리전 없이 프로젝트만으로 기본 초기화
-        print(f"Initializing Vertex AI for project '{PROJECT_ID}'")
-        vertexai.init(project=PROJECT_ID)
+        # 1. [핵심 수정] Grounding을 사용하는 Gemini 모델의 필수 리전인 'us-central1'을
+        #    SDK의 전역 위치로 설정합니다. 모든 모델이 이 엔드포인트를 사용하게 됩니다.
+        print("Initializing Vertex AI with global location: 'us-central1'")
+        vertexai.init(project=PROJECT_ID, location="us-central1")
 
-        # 2. Gemini 모델은 'us-central1'(글로벌 역할) 엔드포인트에서 초기화
-        print("Loading GenerativeModel 'gemini-2.5-pro' from 'us-central1'...")
-        gemini_client_options = client_options.ClientOptions(api_endpoint="us-central1-aiplatform.googleapis.com")
-        google_search_tool = Tool.from_google_search_retrieval(grounding.GoogleSearchRetrieval())
+        # 2. [핵심 수정] Gemini 모델을 초기화할 때, 'system_instruction'을 사용하여
+        #    Google 검색을 통한 Grounding을 명시적으로 활성화합니다.
+        print("Loading GenerativeModel 'gemini-2.5-pro' with Grounding enabled via system instruction...")
         gemini_model = GenerativeModel(
-            "gemini-2.5-pro",
-            tools=[google_search_tool],
-            client_options=gemini_client_options
+            model_name="gemini-2.5-pro",
+            # tools 파라미터 대신 system_instruction을 사용합니다.
+            system_instruction=[
+                "You are an expert in analyzing documents and structuring them into JSON.",
+                "Analyze the given document chunk (image and text).",
+                "Use Google Search to find the latest information if necessary to answer.",
+                "Return the results in JSON format based on the following guidelines:",
+                "1. summary: Summarize the core content of the document chunk clearly and concisely in Korean. If you need the latest information about specific terms, people, or companies mentioned, refer to the web and reflect it in the summary.",
+                "2. extracted_entities: Extract important entities (dates, people, companies, amounts, technical terms, etc.) found in the document.",
+                "3. document_type: Based on this chunk, estimate the document type (e.g., contract, latest tech report, financial analysis, news article, diagram).",
+                "4. keywords: Extract up to 5 core keywords from the content.",
+                "All responses must contain only the JSON object without any other explanation."
+            ],
+            # Grounding을 위한 Tool 객체는 더 이상 필요 없습니다.
         )
 
-        # 3. 임베딩 모델들은 원래 리전('asia-northeast3') 엔드포인트에서 초기화
-        print("Loading Embedding models from 'asia-northeast3'...")
-        embedding_client_options = client_options.ClientOptions(api_endpoint="asia-northeast3-aiplatform.googleapis.com")
-        
-        text_embedding_model = TextEmbeddingModel.from_pretrained(
-            "text-multilingual-embedding-002",
-            client_options=embedding_client_options
-        )
-        multimodal_embedding_model = MultiModalEmbeddingModel.from_pretrained(
-            "multimodalembedding@001",
-            client_options=embedding_client_options
-        )
-        
+        # 3. 임베딩 모델들을 초기화합니다. 전역 설정된 'us-central1'을 사용하므로 별도의 client_options가 필요 없습니다.
+        print("Loading Embedding models...")
+        text_embedding_model = TextEmbeddingModel.from_pretrained("text-multilingual-embedding-002")
+        multimodal_embedding_model = MultiModalEmbeddingModel.from_pretrained("multimodalembedding@001")
+
+        # 4. GCS 클라이언트를 초기화합니다.
         print("Initializing Google Cloud Storage client...")
-        storage_client = storage.Client()
-       
+        storage_client = storage.Client(project=PROJECT_ID)
+
         vertexai_initialized = True
         print("All clients initialized successfully.")
     except Exception as e:
@@ -148,7 +160,8 @@ def process_pdf(blob, conn):
             
             # --- 1. Gemini 2.5 Pro로 메타데이터 추출 (Grounding 사용) ---
             response = gemini_model.generate_content(
-                [GEMINI_PROMPT, Part.from_data(image_bytes, mime_type="image/png"), page_text]
+                #[GEMINI_PROMPT, Part.from_data(image_bytes, mime_type="image/png"), page_text]
+                [Part.from_data(image_bytes, mime_type="image/png"), page_text]
             )
             metadata_json = get_json_from_gemini_response(response)
             
@@ -192,7 +205,8 @@ def process_image(blob, conn):
     try:
         # --- 1. Gemini 2.5 Pro로 메타데이터 추출 (Grounding 사용) ---
         response = gemini_model.generate_content(
-            [GEMINI_PROMPT, Part.from_data(image_bytes, mime_type="image/png")]
+            # [GEMINI_PROMPT, Part.from_data(image_bytes, mime_type="image/png")]
+            [Part.from_data(image_bytes, mime_type="image/png")]
         )
         metadata_json = get_json_from_gemini_response(response)
         
@@ -241,7 +255,8 @@ def process_excel(blob, conn):
 
                 # --- 1. Gemini 2.5 Pro로 메타데이터 추출 (Grounding 사용) ---
                 response = gemini_model.generate_content(
-                    [GEMINI_PROMPT, chunk_text]
+                    #[GEMINI_PROMPT, chunk_text]
+                    [chunk_text]
                 )
                 metadata_json = get_json_from_gemini_response(response)
 
