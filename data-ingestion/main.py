@@ -8,7 +8,8 @@ import ssl
 import pandas as pd
 import vertexai
 from flask import Flask, request
-from google.cloud import alloydb, storage
+from google.cloud import storage
+from smart_open import open # smart_open 라이브러리 사용 추천
 from PIL import Image
 from pypdf import PdfReader
 from vertexai.vision_models import Image as VisionImage
@@ -21,15 +22,12 @@ DB_HOST = os.environ.get("DB_HOST")  # PSC DNS 이름
 DB_USER = os.environ.get("DB_USER")
 DB_PASS = os.environ.get("DB_PASS")
 DB_NAME = os.environ.get("DB_NAME")
-# DB_INSTANCE_CONNECTION_NAME 형식: "project:region:cluster:instance"
-# DB_CONNECTION_NAME = os.environ.get("DB_CONNECTION_NAME") 
 
 # Vertex AI 초기화
 vertexai.init(project=PROJECT_ID, location=REGION)
 
 # 클라이언트 초기화
 storage_client = storage.Client()
-# db_connector = alloydb.Connector()
 embedding_model = MultiModalEmbeddingModel.from_pretrained("multimodalembedding@001")
 
 app = Flask(__name__)

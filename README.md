@@ -85,6 +85,7 @@ gcloud pubsub topics create gcs-file-events
 ```bash
 gcloud storage buckets notifications create gs://[YOUR_GCS_BUCKET_NAME] \
     --topic=gcs-file-events \
+    --path-prefix=pdfs/ \
     --event-types=OBJECT_FINALIZE
 ```
 
@@ -126,7 +127,8 @@ gcloud run deploy file-processor-service \
     --allow-unauthenticated \
     --vpc-connector [VPC_CONNECTOR] \
     --env-vars-file=env.yaml \
-    --service-account [SERVICE_ACCOUNT_EMAIL]
+    --service-account [SERVICE_ACCOUNT_EMAIL] \
+    --memory=2Gi
 ```
 
 *   **`[VPC_CONNECTOR_IN_asia-northeast3]`**: Cloud Run과 **동일한 리전 및 VPC**에 생성된 서버리스 VPC 액세스 커넥터의 이름입니다.
