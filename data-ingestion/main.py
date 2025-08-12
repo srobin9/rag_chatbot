@@ -18,6 +18,7 @@ from vertexai.generative_models import GenerativeModel, Part, Tool
 from vertexai.language_models import TextEmbeddingModel
 from vertexai.vision_models import Image as VisionImage
 from vertexai.vision_models import MultiModalEmbeddingModel
+from vertexai.preview import grounding
 
 # --- 환경 변수 및 클라이언트 초기화 ---
 DB_HOST = os.environ.get("DB_HOST")
@@ -79,7 +80,7 @@ def init_clients():
         multimodal_embedding_model = MultiModalEmbeddingModel.from_pretrained("multimodalembedding@001")
         
         print("Creating Google Search grounding tool...")
-        grounding_tool = Tool.from_google_search_retrieval()
+        grounding_tool = Tool.from_google_search_retrieval(grounding.GoogleSearchRetrieval())
 
         print("Initializing Google Cloud Storage client...")
         storage_client = storage.Client()
