@@ -1,0 +1,9 @@
+Flask==3.0.0
+gunicorn==21.2.0
+google-cloud-aiplatform>=1.47.0
+google-cloud-storage>=2.14.0
+google-cloud-alloydb[pg8000]>=0.1.0
+pypdf>=4.0.0
+Pillow>=10.0.0
+pandas>=2.0.0
+openpyxl>=3.1.0 # pandas가 xlsx 파일을 읽기 위해 필요

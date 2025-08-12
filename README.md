@@ -390,12 +390,13 @@ if __name__ == "__main__":
 평가 결과를 저장할 테이블을 미리 생성합니다.
 
 ```sql
-CREATE TABLE `[YOUR_PROJECT_ID].[YOUR_DATASET_ID].evaluation_results` (
-    prompt STRING,
-    response STRING,
-    evaluation_score INT64,
-    evaluation_reason STRING,
+CREATE OR REPLACE TABLE `[YOUR_PROJECT_ID].[YOUR_DATASET_ID].evaluation_results` (
+    prompt STRING OPTIONS(description="에이전트에게 보낸 질문 또는 프롬프트"),
+    response STRING OPTIONS(description="에이전트가 생성한 답변"),
+    evaluation_score INT64 OPTIONS(description="자동 평가 모델이 채점한 점수"),
+    evaluation_reason STRING OPTIONS(description="점수에 대한 평가 근거"),
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
+);
 );
 ```
 
