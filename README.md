@@ -124,7 +124,7 @@ gcloud services enable \
 
 #### **2.1 Parser Service (`parser-service`)**
 
-PDF를 파싱하고 Gemini를 통해 메타데이터를 추출한 후, 중간 결과물을 GCS에 저장합니다.
+PDF를 파싱하고 Gemini 2.5 Pro를 통해 메타데이터를 추출한 후, 중간 결과물을 GCS에 저장합니다.
 
 *   **프로젝트 구조:**
     ```
@@ -140,9 +140,22 @@ PDF를 파싱하고 Gemini를 통해 메타데이터를 추출한 후, 중간 �
     ```txt
     Flask>=2.0.0
     gunicorn>=20.0.0
-    google-generativeai
     google-cloud-storage
     PyMuPDF>=1.23.0
+    # 인증 및 API 호출에 필요한 라이브러리
+    google-generativeai
+    google-auth
+    ```
+
+*   **`Dockerfile`**
+    ```dockerfile
+    # ... (기존 Dockerfile 내용) ...
+    
+    # 빌드 검증 단계: 실제 코드에서 사용하는 핵심 모듈을 직접 임포트하여 검증합니다.
+    # 이 명령어가 성공하면, main.py에서도 임포트가 성공할 확률이 매우 높습니다.
+    RUN python -c "import google.generativeai; print('google-generativeai SDK verification successful.')"
+    
+    # ... (CMD 명령어) ...
     ```
 
 *   **`env.yaml`**
@@ -152,21 +165,42 @@ PDF를 파싱하고 Gemini를 통해 메타데이터를 추출한 후, 중간 �
     PARSED_BUCKET: "parsed-json-bucket-[PROJECT_ID]"
     ```
 
-*   **`main.py` (요약)**
+*   **`main.py` (핵심 `init_clients` 함수)**
     ```python
-    # ... (import: base64, json, os, fitz, genai, storage 등) ...
-    # 환경변수 로드 및 클라이언트 초기화 (genai, storage_client)
+    import google.generativeai as genai
+    import google.auth
     
-    @app.route("/", methods=["POST"])
-    def process_upload_event():
-        # Pub/Sub 메시지에서 원본 버킷/파일 이름 파싱
-        # GCS에서 PDF 다운로드 및 fitz로 페이지 분리
-        # for 각 페이지:
-            # 텍스트, 이미지 추출
-            # gemini_model.generate_content() 호출하여 JSON 메타데이터 생성
-            # 중간 결과 딕셔너리 생성 (source_file, page_text, image_base64, metadata)
-            # 중간 결과를 PARSED_BUCKET에 JSON 파일로 저장
-        return "OK", 204
+    # ... (기타 import 및 전역 변수 설정) ...
+
+    def init_clients():
+        global clients_initialized, gemini_model, storage_client
+        if clients_initialized: return
+
+        print(f"Initializing clients for parser-service...")
+        try:
+            # 1. Cloud Run 환경의 서비스 계정 인증 정보를 가져옵니다.
+            credentials, project_id = google.auth.default()
+
+            # 2. [가장 중요] client_options를 설정하여 'quota_project_id'를 명시적으로 주입합니다.
+            #    이것이 교차 리전 호출 시 발생하는 PermissionDenied 오류를 해결하는 핵심입니다.
+            client_options = {"quota_project_id": PROJECT_ID}
+            print(f"Specifying quota project ID: {PROJECT_ID}")
+
+            # 3. 인증 정보와 할당량 프로젝트 정보를 모두 사용하여 genai를 설정합니다.
+            genai.configure(
+                credentials=credentials,
+                client_options=client_options,
+            )
+            
+            # 4. 모델과 스토리지 클라이언트를 초기화합니다.
+            gemini_model = genai.GenerativeModel("publishers/google/models/gemini-2.5-pro", system_instruction=SYSTEM_PROMPT)
+            storage_client = storage.Client(project=PROJECT_ID, credentials=credentials)
+
+            clients_initialized = True
+            print("Parser clients initialized successfully with explicit quota project.")
+        
+        except Exception as e:
+            # ... (에러 핸들링) ...
     ```
 
 *   **배포 (`parser-service` 디렉토리에서 실행):**
@@ -211,10 +245,21 @@ PDF를 파싱하고 Gemini를 통해 메타데이터를 추출한 후, 중간 �
     ```txt
     Flask>=2.0.0
     gunicorn>=20.0.0
-    google-cloud-aiplatform
     google-cloud-storage
     pg8000>=1.29.0
+    # GCP 네이티브 라이브러리만 사용합니다.
+    google-cloud-aiplatform[generative_ai]
     ```
+*   **`Dockerfile`**
+    ```dockerfile
+    # ... (기존 Dockerfile 내용) ...
+    
+    # 빌드 검증 단계: Vertex AI SDK가 올바르게 설치되었는지 확인합니다.
+    RUN python -c "import vertexai; print('Vertex AI SDK verification successful.')"
+    
+    # ... (CMD 명령어) ...
+    ```
+
 *   **`env.yaml`**
     ```yaml
     GCP_PROJECT: "[YOUR_PROJECT_ID]"
@@ -225,20 +270,33 @@ PDF를 파싱하고 Gemini를 통해 메타데이터를 추출한 후, 중간 �
     DB_NAME: "document_embeddings"
     ```
 
-*   **`main.py` (요약)**
+*   **`main.py` (핵심 `init_clients` 함수)**
     ```python
-    # ... (import: base64, json, os, pg8000, storage, aiplatform 등) ...
-    # 환경변수 로드 및 클라이언트 초기화 (TextEmbeddingModel, MultiModalEmbeddingModel, storage_client)
+    import vertexai
+    from vertexai.generative_models import GenerativeModel, Part
     
-    @app.route("/", methods=["POST"])
-    def process_parsed_event():
-        # Pub/Sub 메시지에서 중간 데이터 버킷/파일 이름 파싱
-        # GCS에서 중간 데이터 JSON 다운로드
-        # JSON에서 summary, page_text, image_base64 추출
-        # text_embedding_model.get_embeddings() 호출
-        # multimodal_embedding_model.embed_images() 호출
-        # AlloyDB에 최종 결과 저장
-        return "OK", 204
+    # ... (기타 import 및 전역 변수 설정) ...
+
+    def init_clients():
+        global clients_initialized, text_embedding_model, multimodal_embedding_model, storage_client
+        if clients_initialized: return
+        
+        print(f"Initializing clients with Vertex AI SDK...")
+        try:
+            # Vertex AI SDK는 GCP 환경의 컨텍스트(프로젝트, 인증)를 자동으로 인식합니다.
+            # location은 모델이 있는 리전을 명시합니다.
+            vertexai.init(project=PROJECT_ID, location=EMBEDDING_REGION)
+            
+            # 모델과 클라이언트를 초기화합니다.
+            text_embedding_model = TextEmbeddingModel.from_pretrained("text-multilingual-embedding-002")
+            multimodal_embedding_model = MultiModalEmbeddingModel.from_pretrained("multimodalembedding@001")
+            storage_client = storage.Client(project=PROJECT_ID)
+            
+            clients_initialized = True
+            print("Embedder clients initialized successfully.")
+        
+        except Exception as e:
+            # ... (에러 핸들링) ...
     ```
 
 *   **배포 (`embedder-service` 디렉토리에서 실행):**
@@ -595,6 +653,19 @@ CREATE OR REPLACE TABLE `[YOUR_PROJECT_ID].[YOUR_DATASET_ID].evaluation_results`
 **A:** Cloud Run이 AlloyDB의 PSC DNS 주소를 IP로 변환하지 못하는, 전형적인 **비공개 DNS 조회 문제**입니다.
 1.  **해결책:** **[Phase 1의 2단계](#2-alloydb-for-postgresql-설정)**에 있는 **PSC용 비공개 DNS 영역 설정** 가이드를 다시 한번 꼼꼼히 확인하고 그대로 실행하세요. `goog` DNS 이름으로 비공개 영역을 만들고 VPC에 연결한 후, A 레코드를 추가해야 합니다.
 
+#### Q: `gcloud run deploy` 실행 중 빌드 단계에서 `ModuleNotFoundError`가 발생합니다.
+
+**A:** `Dockerfile` 내부의 검증 단계(`RUN python -c "import ..."`)가 `requirements.txt`에 명시된 라이브러리와 일치하지 않기 때문입니다.
+*   **`parser-service`**의 `Dockerfile`은 `import google.generativeai`를 검증해야 합니다.
+*   **`embedder-service`**의 `Dockerfile`은 `import vertexai`를 검증해야 합니다.
+*   각 서비스에 맞는 라이브러리를 검증하도록 `Dockerfile`을 수정하세요.
+
+#### Q: Cloud Run 로그에 `ACCESS_TOKEN_SCOPE_INSUFFICIENT` 또는 `PermissionDenied`가 발생합니다.
+
+**A:** 이 문제는 범용 라이브러리(`google-generativeai`)를 사용하여 Cloud Run 서비스 리전과 다른 리전의 API(예: 서울 -> us-central1)를 호출할 때 발생합니다. 라이브러리가 API 요청에 대한 **비용/할당량 책임 프로젝트(Quota Project)를 지정하지 못하기 때문**입니다.
+1.  **해결책:** `parser-service`의 `main.py`와 같이, `genai.configure()` 함수에 `client_options={"quota_project_id": "YOUR_PROJECT_ID"}`를 명시적으로 전달해야 합니다.
+2.  **참고:** `google-cloud-aiplatform` SDK는 GCP 환경에 최적화되어 있어 이 문제가 거의 발생하지 않습니다.
+
 #### Q: 왜 파서(parser)와 임베더(embedder) 서비스를 분리해야 하나요?
 
-**A: 이것이 이 아키텍처의 가장 핵심적인 결정입니다.** `google-cloud-aiplatform` 라이브러리의 최신 버전은, 새로운 `google-generativeai` 라이브러리를 필수 의존성으로 포함합니다. 이로 인해 두 라이브러리가 하나의 환경에 함께 설치되면 **네임스페이스 충돌**이 발생하여, `google.cloud.aiplatform.language_models` 와 같은 예전 모듈 경로를 찾지 못하는 `ModuleNotFoundError`가 발생합니다. **두 서비스의 책임을 명확히 분리하고 각각 필요한 라이브러리만 독립적으로 설치하는 것이 이 문제를 해결하는 가장 근본적이고 올바른 방법입니다.**
+**A: 이것이 이 아키텍처의 가장 핵심적인 결정입니다.** `google-cloud-aiplatform` 라이브러리의 최신 버전은, 새로운 `google-generativeai` 라이브러리를 필수 의존성으로 포함합니다. 이로 인해 두 라이브러리가 하나의 환경에 함께 설치되면 **네임스페이스 충돌**이 발생하여, `google.cloud.aiplatform.language_models` 와 같은 예전 모듈 경로를 찾지 못하는 `ModuleNotFoundError`가 발생할 수 있습니다. **두 서비스의 책임을 명확히 분리하고 각각 필요한 라이브러리만 독립적으로 설치하는 것이 이 문제를 해결하는 가장 근본적이고 올바른 방법입니다.**

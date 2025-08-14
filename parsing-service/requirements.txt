@@ -1,6 +1,6 @@
-# 생성 모델에만 집중
-Flask>=2.0.0
-gunicorn>=20.0.0
-google-generativeai
+# requirements.txt
+flask
 google-cloud-storage
-PyMuPDF>=1.23.0
+google-cloud-aiplatform
+PyMuPDF
+gunicorn
