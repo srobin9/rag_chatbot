@@ -2,9 +2,10 @@
 Flask>=2.0.0
 gunicorn>=20.0.0
 
-# Google Cloud Libraries
-google-cloud-aiplatform>=1.49.0
-google-cloud-storage>=2.0.0
+# Google Cloud Libraries (하이브리드 방식)
+google-cloud-aiplatform
+google-cloud-storage
+google-generativeai # 새로운 생성 AI 라이브러리 명시적 추가
 
 # Database Connector
 pg8000>=1.29.0

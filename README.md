@@ -34,21 +34,14 @@ gcloud services enable \
 1.  **AlloyDB 클러스터 및 인스턴스 생성:**
     *   Cloud Console 또는 `gcloud`를 사용하여 클러스터와 기본 인스턴스를 생성합니다. 이때, **Private Service Connect(PSC)를 사용**하여 비공개 IP 연결을 설정합니다.
 
-2.  **PSC 연결 수락:**
-    *   AlloyDB 인스턴스의 '연결' 탭으로 이동합니다.
-    *   'PSC 엔드포인트' 섹션에서 상태가 **`⚠️ 확인 필요`**인 연결 요청을 **수락(Accept)**합니다.
-    *   **[중요]** 만약 조직 정책 오류로 수락이 불가능하다면, [트러블슈팅](#q-alloydb-psc-엔드포인트-연결-수락이-실패합니다) 섹션을 참조하세요.
-    *   수락이 완료되면 엔드포인트 상태가 **`✅ 수락됨`**으로 바뀌고, 내부 IP와 **DNS 이름**이 할당됩니다. 이 DNS 이름을 다음 단계에서 사용합니다.
+2.  **PSC 연결 수락 및 DNS 영역 설정:**
+    *   AlloyDB 인스턴스의 '연결' 탭으로 이동하여 PSC 연결 요청을 **수락(Accept)**하고, 할당된 **DNS 이름**을 확인합니다.
+    *   **[가장 중요]** Cloud Run에서 이 DNS 이름을 찾을 수 있도록, **반드시 PSC용 비공개 DNS 영역(Private DNS Zone)을 설정해야 합니다.** 이 단계가 누락되면 `Name or service not known` 오류가 발생합니다. 상세 과정은 [트러블슈팅](#q-cloud-run-로그에-name-or-service-not-known-또는-cant-create-a-connection-to-host-오류가-발생합니다)을 참조하세요.
 
-3.  **PSC용 비공개 DNS 영역(Private DNS Zone) 설정**
-    *   이 단계가 누락되면 Cloud Run에서 **`Name or service not known`** 오류가 발생합니다.
-    *   `goog` DNS 이름으로 비공개 영역을 만들고 VPC에 연결한 후, PSC의 전체 DNS 이름과 IP 주소로 **A 레코드**를 추가해야 합니다.
-
-4.  **데이터베이스 접속 및 생성:**
+3.  **데이터베이스 접속 및 생성:**
     *   AlloyDB는 VPC 내부에 있으므로, **동일한 VPC에 연결된 GCE VM**을 통해 접속해야 합니다.
-    *   GCE VM에 SSH로 접속한 후, 아래 명령어로 `psql` 클라이언트를 사용하여 접속합니다. `[PSC_DNS_NAME]`을 위에서 확인한 DNS 이름으로 변경하세요.
+    *   GCE VM에 SSH로 접속 후, `psql` 클라이언트를 사용하여 접속합니다.
         ```bash
-        # psql 클라이언트가 없다면 설치: sudo apt-get update && sudo apt-get install -y postgresql-client
         psql -h [PSC_DNS_NAME] -U postgres -d postgres
         ```
     *   접속 후, PoC에 사용할 데이터베이스를 생성합니다.
@@ -56,16 +49,12 @@ gcloud services enable \
         CREATE DATABASE document_embeddings;
         ```
 
-5.  **`pgvector` 확장 활성화 및 테이블 생성:**
+4.  **`pgvector` 확장 활성화 및 테이블 생성:**
     *   새로 만든 데이터베이스에 다시 접속(`\c document_embeddings`)한 후, 다음 SQL 쿼리를 실행합니다.
         ```sql
-        -- pgvector 확장 기능 활성화
         CREATE EXTENSION IF NOT EXISTS vector;
-
-        -- 기존 테이블이 있다면 삭제합니다.
         DROP TABLE IF EXISTS document_embeddings;
 
-        -- 벡터 데이터와 메타데이터를 저장할 테이블 생성
         CREATE TABLE document_embeddings (
             id SERIAL PRIMARY KEY,
             source_file VARCHAR(1024) NOT NULL,
@@ -78,147 +67,200 @@ gcloud services enable \
 
         CREATE INDEX ON document_embeddings USING hnsw (text_embedding vector_l2_ops);
         CREATE INDEX ON document_embeddings USING hnsw (multimodal_embedding vector_l2_ops);
+        ```
+
+#### **3. GCS 버킷 생성**
+
+아키텍처에 필요한 두 개의 버킷을 생성합니다.
+
+1.  **원본 PDF 업로드용 버킷:**
+    ```bash
+    gsutil mb gs://original-pdfs-bucket-[PROJECT_ID]
+    ```
+2.  **파싱된 중간 데이터 저장용 버킷:**
+    ```bash
+    gsutil mb gs://parsed-json-bucket-[PROJECT_ID]
     ```
 
-#### **3. Pub/Sub 토픽 생성**
+#### **4. Pub/Sub 토픽 및 알림 설정**
 
-GCS 파일 업로드 이벤트를 수신할 Pub/Sub 토픽을 생성합니다.
+두 서비스 간의 통신을 위해 두 개의 Pub/Sub 토픽과 GCS 알림을 설정합니다.
 
-```bash
-gcloud pubsub topics create gcs-file-events
-```
+1.  **Parser 서비스 트리거용 토픽 및 알림:**
+    ```bash
+    # 토픽 생성
+    gcloud pubsub topics create pdf-upload-events
 
-#### **4. GCS 버킷 알림 설정**
+    # 원본 버킷 알림 설정
+    gcloud storage buckets notifications create gs://original-pdfs-bucket-[PROJECT_ID] \
+        --topic=pdf-upload-events \
+        --event-types=OBJECT_FINALIZE
+    ```
+2.  **Embedder 서비스 트리거용 토픽 및 알림:**
+    ```bash
+    # 토픽 생성
+    gcloud pubsub topics create parsed-json-events
 
-샘플 데이터가 업로드된 GCS 버킷에 파일이 생성될 때마다 위에서 만든 Pub/Sub 토픽으로 알림을 보내도록 설정합니다.
-
-```bash
-gcloud storage buckets notifications create gs://[YOUR_GCS_BUCKET_NAME] \
-    --topic=gcs-file-events \
-    --path-prefix=pdfs/ \
-    --event-types=OBJECT_FINALIZE
-```
+    # 중간 데이터 버킷 알림 설정
+    gcloud storage buckets notifications create gs://parsed-json-bucket-[PROJECT_ID] \
+        --topic=parsed-json-events \
+        --event-types=OBJECT_FINALIZE
+    ```
 
 ---
 
-### **Phase 2: 데이터 수집 및 처리 서브시스템 (Data Ingestion & Processing)**
+### **Phase 2: 데이터 처리 파이프라인 (서비스 분리 아키텍처)**
 
-#### **1. 서비스 코드 및 의존성 준비**
+여러 번의 빌드 실패를 통해, **`google-cloud-aiplatform` 최신 버전이 `google-genai`를 의존성으로 포함하며 발생하는 네임스페이스 충돌**이 `ModuleNotFoundError`의 근본 원인임을 확인했습니다.
 
-**`requirements.txt` 파일 준비**
+이를 해결하는 가장 올바르고 안정적인 방법은, **책임이 다른 두 프로세스를 별도의 Cloud Run 서비스로 완전히 분리**하는 것입니다.
 
-가장 먼저 `main.py`가 위치한 디렉토리에 `requirements.txt` 파일을 생성하고, 서비스에 필요한 라이브러리와 **최신 Vertex AI SDK 버전**을 명시적으로 지정해야 합니다. SDK 버전이 낮으면 `client_options` 같은 중요 파라미터를 인식하지 못해 `TypeError`가 발생합니다.
+*   **`parser-service`**: PDF 파싱과 메타데이터 생성을 담당하며, `google-generativeai` 라이브러리만 사용합니다.
+*   **`embedder-service`**: 텍스트/멀티모달 임베딩과 DB 저장을 담당하며, `google-cloud-aiplatform` 라이브러리만 사용합니다.
 
-`~/rag_chatbot/data-ingestion/requirements.txt`
-```txt
-# Flask and Web Server
-Flask>=2.0.0
-gunicorn>=20.0.0
+이 아키텍처는 라이브러리 충돌을 원천적으로 차단하고, 각 서비스를 독립적으로 관리 및 확장할 수 있게 해줍니다.
 
-# Google Cloud Libraries
-google-cloud-aiplatform>=1.49.0
-google-cloud-storage>=2.0.0
+---
 
-# Database Connector
-pg8000>=1.29.0
+#### **2.1 Parser Service (`parser-service`)**
 
-# Document Processing
-PyMuPDF>=1.23.0
-pandas>=2.0.0
-openpyxl>=3.1.0
-```
+PDF를 파싱하고 Gemini를 통해 메타데이터를 추출한 후, 중간 결과물을 GCS에 저장합니다.
 
-**`main.py` 코드 준비 (최종 아키텍처 반영)**
-
-`main.py` 코드는 여러 모델이 각기 다른 최적의 API 엔드포인트에 존재한다는 사실을 반영해야 합니다. `ClientOptions`를 사용하여 각 모델을 초기화할 때 명시적으로 엔드포인트를 지정하는 것이 가장 안정적인 방법입니다.
-
-*   **핵심 원리:**
-    *   `gemini-2.5-pro`와 같은 최신 LLM은 `us-central1` 리전에서 가장 먼저 제공되며, 사실상의 글로벌 엔드포인트 역할을 합니다.
-    *   `text-multilingual-embedding-002`와 같은 임베딩 모델은 `asia-northeast3`를 포함한 여러 리전에서 안정적으로 제공됩니다.
-    *   따라서 각 모델을 **자신이 존재하는 올바른 엔드포인트 주소**로 직접 호출해야 합니다.
-
-*   **`main.py`의 `init_clients` 함수 수정 예시:**
-    ```python
-    # ClientOptions를 사용하기 위해 추가
-    from google.api_core import client_options
-    # ... 다른 import 구문
-
-    def init_clients():
-        # ...
-        try:
-            # 1. SDK를 특정 리전 없이 프로젝트만으로 기본 초기화
-            vertexai.init(project=PROJECT_ID)
-
-            # 2. Gemini 모델은 'us-central1' 엔드포인트에서 초기화
-            gemini_client_options = client_options.ClientOptions(api_endpoint="us-central1-aiplatform.googleapis.com")
-            google_search_tool = Tool.from_google_search_retrieval(grounding.GoogleSearchRetrieval())
-            gemini_model = GenerativeModel(
-                "gemini-2.5-pro",
-                tools=[google_search_tool],
-                client_options=gemini_client_options
-            )
-
-            # 3. 임베딩 모델들은 원래 리전('asia-northeast3') 엔드포인트에서 초기화
-            embedding_client_options = client_options.ClientOptions(api_endpoint="asia-northeast3-aiplatform.googleapis.com")
-            text_embedding_model = TextEmbeddingModel.from_pretrained(
-                "text-multilingual-embedding-002",
-                client_options=embedding_client_options
-            )
-            # ... 다른 모델도 동일하게 client_options 적용 ...
-        # ...
+*   **프로젝트 구조:**
+    ```
+    rag_poc/
+    └── parser-service/
+        ├── main.py
+        ├── requirements.txt
+        ├── Dockerfile
+        └── env.yaml
     ```
 
-#### **2. 환경 변수 파일 생성 (`env.yaml`)**
+*   **`requirements.txt`**
+    ```txt
+    Flask>=2.0.0
+    gunicorn>=20.0.0
+    google-generativeai
+    google-cloud-storage
+    PyMuPDF>=1.23.0
+    ```
 
-`GCP_PROJECT`는 Cloud Run의 기본 환경변수가 아니므로, **반드시 명시적으로 추가해야 합니다.**
+*   **`env.yaml`**
+    ```yaml
+    GCP_PROJECT: "[YOUR_PROJECT_ID]"
+    REGION: "us-central1" # Gemini 2.5 Pro 사용 리전
+    PARSED_BUCKET: "parsed-json-bucket-[PROJECT_ID]"
+    ```
 
-`~/rag_chatbot/data-ingestion/env.yaml` 파일을 아래 내용으로 생성하세요.
-```yaml
-GCP_PROJECT: "[YOUR_PROJECT_ID]"  # [필수] SDK가 프로젝트를 인식하도록 명시적으로 추가
-REGION: "asia-northeast3"         # 임베딩 모델 등을 위한 리전 정보
-DB_HOST: "[PSC_DNS_NAME]"
-DB_USER: "postgres"
-DB_PASS: "[YOUR_DB_PASSWORD]"
-DB_NAME: "document_embeddings"
-```
+*   **`main.py` (요약)**
+    ```python
+    # ... (import: base64, json, os, fitz, genai, storage 등) ...
+    # 환경변수 로드 및 클라이언트 초기화 (genai, storage_client)
+    
+    @app.route("/", methods=["POST"])
+    def process_upload_event():
+        # Pub/Sub 메시지에서 원본 버킷/파일 이름 파싱
+        # GCS에서 PDF 다운로드 및 fitz로 페이지 분리
+        # for 각 페이지:
+            # 텍스트, 이미지 추출
+            # gemini_model.generate_content() 호출하여 JSON 메타데이터 생성
+            # 중간 결과 딕셔너리 생성 (source_file, page_text, image_base64, metadata)
+            # 중간 결과를 PARSED_BUCKET에 JSON 파일로 저장
+        return "OK", 204
+    ```
 
-#### **3. Cloud Run 서비스 배포**
+*   **배포 (`parser-service` 디렉토리에서 실행):**
+    ```bash
+    gcloud run deploy parser-service \
+        --source . \
+        --region asia-northeast3 \
+        --allow-unauthenticated \
+        --vpc-connector [VPC_CONNECTOR] \
+        --vpc-egress=all-traffic \
+        --env-vars-file=env.yaml \
+        --service-account [SERVICE_ACCOUNT_EMAIL] \
+        --memory=2Gi \
+        --timeout=600
+    ```
 
-`main.py`가 있는 디렉토리에서 다음 명령어를 실행하여 서비스를 배포합니다.
+*   **Pub/Sub 구독 생성:**
+    ```bash
+    gcloud pubsub subscriptions create pdf-upload-subscription \
+        --topic pdf-upload-events \
+        --push-endpoint=$(gcloud run services describe parser-service --platform managed --region asia-northeast3 --format "value(status.url)") \
+        --push-auth-service-account=[CLOUD_RUN_INVOKER_SA]
+    ```
 
-```bash
-cd ~/rag_chatbot/data-ingestion
+---
 
-gcloud run deploy file-processor-service \
-    --source . \
-    --platform managed \
-    --region [REGION] \
-    --allow-unauthenticated \
-    --vpc-connector [VPC_CONNECTOR] \
-    --vpc-egress=all-traffic \
-    --env-vars-file=env.yaml \
-    --service-account [SERVICE_ACCOUNT_EMAIL] \
-    --memory=2Gi
-```
+#### **2.2 Embedder Service (`embedder-service`)**
 
-*   **`[VPC_CONNECTOR]`**: Cloud Run과 **동일한 리전 및 VPC**에 생성된 서버리스 VPC 액세스 커넥터의 이름입니다.
-*   **`[SERVICE_ACCOUNT_EMAIL]`**: 배포에 사용할 서비스 계정입니다. 이 계정은 다음 권한을 필수로 가집니다.
-    *   Vertex AI 사용자 (`roles/aiplatform.user`)
-    *   Storage 객체 뷰어 (`roles/storage.objectViewer`)
-    *   **서버리스 VPC 액세스 사용자 (`roles/vpcaccess.user`)**
+`parser-service`가 생성한 중간 JSON 파일을 입력받아, 임베딩을 생성하고 AlloyDB에 최종 저장합니다.
 
-*   **[중요]** 배포 시 VPC 커넥터 권한 오류가 발생하면 [트러블슈팅](#q-gcloud-run-deploy-실행-시-vpc-커넥터-오류가-발생합니다) 섹션을 반드시 확인하세요.
+*   **프로젝트 구조:**
+    ```
+    rag_poc/
+    └── embedder-service/
+        ├── main.py
+        ├── requirements.txt
+        ├── Dockerfile
+        └── env.yaml
+    ```
 
-#### **4. Pub/Sub 구독 생성**
+*   **`requirements.txt`**
+    ```txt
+    Flask>=2.0.0
+    gunicorn>=20.0.0
+    google-cloud-aiplatform
+    google-cloud-storage
+    pg8000>=1.29.0
+    ```
+*   **`env.yaml`**
+    ```yaml
+    GCP_PROJECT: "[YOUR_PROJECT_ID]"
+    EMBEDDING_REGION: "asia-northeast3" # 임베딩 모델 사용 리전
+    DB_HOST: "[PSC_DNS_NAME]"
+    DB_USER: "postgres"
+    DB_PASS: "[YOUR_DB_PASSWORD]"
+    DB_NAME: "document_embeddings"
+    ```
 
-GCS 알림 토픽과 `file-processor-service`를 연결하는 Push 구독을 생성합니다.
+*   **`main.py` (요약)**
+    ```python
+    # ... (import: base64, json, os, pg8000, storage, aiplatform 등) ...
+    # 환경변수 로드 및 클라이언트 초기화 (TextEmbeddingModel, MultiModalEmbeddingModel, storage_client)
+    
+    @app.route("/", methods=["POST"])
+    def process_parsed_event():
+        # Pub/Sub 메시지에서 중간 데이터 버킷/파일 이름 파싱
+        # GCS에서 중간 데이터 JSON 다운로드
+        # JSON에서 summary, page_text, image_base64 추출
+        # text_embedding_model.get_embeddings() 호출
+        # multimodal_embedding_model.embed_images() 호출
+        # AlloyDB에 최종 결과 저장
+        return "OK", 204
+    ```
 
-```bash
-gcloud pubsub subscriptions create gcs-file-event-subscription \
-    --topic gcs-file-events \
-    --push-endpoint=$(gcloud run services describe file-processor-service --platform managed --region asia-northeast3 --format "value(status.url)") \
-    --push-auth-service-account=[CLOUD_RUN_INVOKER_SERVICE_ACCOUNT_EMAIL]
-```
+*   **배포 (`embedder-service` 디렉토리에서 실행):**
+    ```bash
+    gcloud run deploy embedder-service \
+        --source . \
+        --region asia-northeast3 \
+        --allow-unauthenticated \
+        --vpc-connector [VPC_CONNECTOR] \
+        --vpc-egress=all-traffic \
+        --env-vars-file=env.yaml \
+        --service-account [SERVICE_ACCOUNT_EMAIL] \
+        --memory=2Gi \
+        --timeout=600
+    ```
+*   **Pub/Sub 구독 생성:**
+    ```bash
+    gcloud pubsub subscriptions create parsed-json-subscription \
+        --topic parsed-json-events \
+        --push-endpoint=$(gcloud run services describe embedder-service --platform managed --region asia-northeast3 --format "value(status.url)") \
+        --push-auth-service-account=[CLOUD_RUN_INVOKER_SA]
+    ```
 
 ---
 
@@ -319,12 +361,15 @@ if __name__ == "__main__":
 
 5.  **백필 스크립트 실행:**
     이제 모든 준비가 끝났습니다. 아래 명령어를 실행하여 백필을 시작합니다. `[PLACEHOLDER]` 부분들을 실제 값으로 변경하세요.
+    `backfill.py` 스크립트는 **원본 PDF가 있는 GCS 버킷**을 대상으로 실행하여, 전체 파이프라인을 처음부터 다시 트리거합니다.
+
+    `backfill.py` 스크립트 실행 명령어:
     ```bash
     python backfill.py \
         --project_id [YOUR_PROJECT_ID] \
-        --gcs_bucket [YOUR_GCS_BUCKET_NAME] \
+        --gcs_bucket original-pdfs-bucket-[PROJECT_ID] \
         --gcs_prefix pdfs/ \
-        --topic_id gcs-file-events
+        --topic_id pdf-upload-events
     ```
 
 #### **3. 결과 모니터링**
@@ -549,3 +594,7 @@ CREATE OR REPLACE TABLE `[YOUR_PROJECT_ID].[YOUR_DATASET_ID].evaluation_results`
 
 **A:** Cloud Run이 AlloyDB의 PSC DNS 주소를 IP로 변환하지 못하는, 전형적인 **비공개 DNS 조회 문제**입니다.
 1.  **해결책:** **[Phase 1의 2단계](#2-alloydb-for-postgresql-설정)**에 있는 **PSC용 비공개 DNS 영역 설정** 가이드를 다시 한번 꼼꼼히 확인하고 그대로 실행하세요. `goog` DNS 이름으로 비공개 영역을 만들고 VPC에 연결한 후, A 레코드를 추가해야 합니다.
+
+#### Q: 왜 파서(parser)와 임베더(embedder) 서비스를 분리해야 하나요?
+
+**A: 이것이 이 아키텍처의 가장 핵심적인 결정입니다.** `google-cloud-aiplatform` 라이브러리의 최신 버전은, 새로운 `google-generativeai` 라이브러리를 필수 의존성으로 포함합니다. 이로 인해 두 라이브러리가 하나의 환경에 함께 설치되면 **네임스페이스 충돌**이 발생하여, `google.cloud.aiplatform.language_models` 와 같은 예전 모듈 경로를 찾지 못하는 `ModuleNotFoundError`가 발생합니다. **두 서비스의 책임을 명확히 분리하고 각각 필요한 라이브러리만 독립적으로 설치하는 것이 이 문제를 해결하는 가장 근본적이고 올바른 방법입니다.**

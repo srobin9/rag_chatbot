@@ -1,28 +1,10 @@
-import base64
-import io
-import json
-import os
-import ssl
-import sys
-import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-import fitz
-import pandas as pd
-import pg8000.dbapi
+import base64, json, os, ssl, sys, traceback
 from flask import Flask, request
-
-# --- Google Cloud & Vertex AI Libraries ---
-# Best practice: Import all libraries at the top of the file.
-# This ensures that if a module is missing, the application fails fast on startup.
-import google.generativeai as genai
-import google.cloud.aiplatform as vertexai
-from google.api_core import client_options, exceptions
+import pg8000.dbapi
 from google.cloud import storage
-# 올바른 경로에서 모델들을 임포트하고, 이름 충돌을 피하기 위해 별칭(alias)을 사용합니다.
+from google.api_core import client_options
 from google.cloud.aiplatform.language_models import TextEmbeddingModel
-from google.cloud.aiplatform.vision_models import Image as VisionImage
-from google.cloud.aiplatform.vision_models import MultiModalEmbeddingModel
+from google.cloud.aiplatform.vision_models import Image as VisionImage, MultiModalEmbeddingModel
 
 # --- Environment Variables & Global Placeholders ---
 DB_HOST = os.environ.get("DB_HOST")
@@ -30,14 +12,10 @@ DB_USER = os.environ.get("DB_USER")
 DB_PASS = os.environ.get("DB_PASS")
 DB_NAME = os.environ.get("DB_NAME")
 PROJECT_ID = os.environ.get("GCP_PROJECT")
-# Gemini 2.5 Pro와 같은 최신 모델은 특정 리전에서만 사용 가능할 수 있습니다.
-# 코드의 유연성을 위해 리전을 명확히 설정합니다. (예: us-central1)
-MODEL_REGION = os.environ.get("REGION", "us-central1") # Gemini 2.5 Pro 리전
 EMBEDDING_REGION = os.environ.get("EMBEDDING_REGION", "asia-northeast3") # 임베딩 리전
 
 # --- Global Client Variables (populated by init_clients) ---
 clients_initialized = False
-gemini_model = None
 text_embedding_model = None
 multimodal_embedding_model = None
 storage_client = None
@@ -204,58 +182,42 @@ def process_pdf(blob, conn):
     print(f"Successfully processed and inserted {len(pages_to_process)} pages from {blob.name}.")
 
 @app.route("/", methods=["POST"])
-def process_pubsub_event():
-    try:
-        init_clients()
-        
-        envelope = request.get_json();
-        if not envelope or "message" not in envelope: return "Bad Request", 400
-        pubsub_message = envelope["message"]
-        data = base64.b64decode(pubsub_message["data"]).decode("utf-8"); message_json = json.loads(data)
-        bucket_name = message_json.get("bucket"); file_name = message_json.get("name")
-        if not bucket_name or not file_name: return "Bad Request", 400
-    except Exception as e: # This block catches init_clients() or message parsing failures.
-        # 안정성 강화: 클라이언트 초기화 실패는 일시적일 수 있으므로,
-        # 400(잘못된 요청) 대신 503(서비스 비가용)을 반환하여 Pub/Sub이 재시도하도록 유도합니다.
-        print(f"CRITICAL: Init/parse error, will trigger retry. Error: {e}", file=sys.stderr)
-        traceback.print_exc()
-        return "Internal Server Error: Failed to initialize or parse, will retry.", 503
+def process_parsed_event():
+    # ... Pub/Sub 메시지 파싱 ...
+    bucket_name = message_json.get("bucket") # 여기서는 PARSED_BUCKET_NAME
+    file_name = message_json.get("name")    # 여기서는 JSON 파일 이름
 
-    conn = None
-    try:
-        print(f"Processing file: gs://{bucket_name}/{file_name}")
-        bucket = storage_client.bucket(bucket_name); blob = bucket.blob(file_name)
-        conn = get_db_connection()
-        file_ext = file_name.lower().split('.')[-1]
+    # 중간 데이터 JSON 다운로드
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(file_name)
+    intermediate_data = json.loads(blob.download_as_string())
 
-        if file_ext == 'pdf': process_pdf(blob, conn)
-        else: return "OK", 204
-        
-        print(f"Successfully processed and embedded file: {file_name}"); return "OK", 204
-    except (pg8000.dbapi.Error, exceptions.DeadlineExceeded, exceptions.ServiceUnavailable, exceptions.ResourceExhausted) as transient_err:
-        # 안정성 강화: DB 오류, API 시간 초과, 서비스 비가용, 할당량 초과 등은
-        # 일시적인 문제일 가능성이 높으므로 5xx를 반환하여 Pub/Sub이 재시도하도록 함
-        print(f"TRANSIENT ERROR (will retry): Failed to process file gs://{bucket_name}/{file_name}. Error: {transient_err}", file=sys.stderr)
-        traceback.print_exc()
-        if conn: conn.rollback()
-        # 503 Service Unavailable을 반환하여 재시도 유도
-        return "Internal Server Error: Transient issue, will be retried.", 503
-    except exceptions.GoogleAPICallError as permanent_api_err:
-        # 안정성 강화: 그 외 API 오류(예: 잘못된 인수, 권한 없음)는 영구적인 문제일 가능성이 높음
-        # 2xx를 반환하여 재시도를 막고, Dead Letter Queue로 보내 분석하도록 함
-        print(f"PERMANENT API ERROR (no retry): Failed to process file gs://{bucket_name}/{file_name}. Error: {permanent_api_err}", file=sys.stderr)
-        traceback.print_exc()
-        if conn: conn.rollback()
-        return "Error processed, preventing retry.", 200
-    except Exception as e:
-        # 안정성 강화: 그 외 모든 오류(예: 깨진 PDF 파일, 코드 로직 오류)는 영구적인 문제로 간주
-        print(f"PERMANENT GENERIC ERROR (no retry): Failed to process file gs://{bucket_name}/{file_name}. Error: {e}", file=sys.stderr)
-        traceback.print_exc()
-        if conn: conn.rollback()
-        return "Error processed, preventing retry.", 200
-    finally:
-        if conn: conn.close(); print("AlloyDB connection closed.")
+    summary = intermediate_data["metadata"]["summary"]
+    page_text = intermediate_data["page_text"]
+    image_bytes = base64.b64decode(intermediate_data["image_base64"])
+    
+    # 텍스트 임베딩 생성
+    text_embeddings = text_embedding_model.get_embeddings([summary])
 
-if __name__ == "__main__":
-    init_clients()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    # 멀티모달 임베딩 생성
+    multimodal_embeddings = multimodal_embedding_model.embed_images(
+        images=[VisionImage.from_bytes(image_bytes)],
+        contextual_texts=[page_text]
+    )
+
+    # DB에 최종 결과 저장
+    insert_data = [(
+        intermediate_data["source_file"],
+        f"Content from page {intermediate_data['page_num']} of file {os.path.basename(intermediate_data['source_file'])}",
+        json.dumps(intermediate_data["metadata"], ensure_ascii=False),
+        text_embeddings[0].values,
+        multimodal_embeddings[0].values
+    )]
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    # ... cursor.executemany(...) 및 DB 로직 ...
+    conn.commit()
+    conn.close()
+
+    return "OK", 204

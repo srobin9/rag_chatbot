@@ -1,0 +1,5 @@
+steps:
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['build', '--no-cache', '-t', 'gcr.io/p-khm8-dev-svc/file-processor-service', '.']
+images:
+- 'gcr.io/p-khm8-dev-svc/file-processor-service'
