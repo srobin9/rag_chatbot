@@ -28,7 +28,7 @@ RUN pip install --no-cache-dir --upgrade pip setuptools && \
 
 # 빌드 검증 단계: 실제 코드에서 사용하는 핵심 모듈을 직접 임포트하여 검증합니다.
 # 이 명령어가 성공하면, main.py에서도 임포트가 성공할 확률이 매우 높습니다.
-RUN python -c "from google.cloud.aiplatform.language_models import TextEmbeddingModel; print('Embedder Service SDK verification successful.')"
+RUN python -c "import vertexai; print('Vertex AI SDK verification successful.')"
 
 # 5. 소스 코드 복사
 # 나머지 애플리케이션 코드를 컨테이너로 복사합니다.

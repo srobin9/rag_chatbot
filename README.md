@@ -111,14 +111,10 @@ gcloud services enable \
 
 ### **Phase 2: 데이터 처리 파이프라인 (서비스 분리 아키텍처)**
 
-여러 번의 빌드 실패를 통해, **`google-cloud-aiplatform` 최신 버전이 `google-genai`를 의존성으로 포함하며 발생하는 네임스페이스 충돌**이 `ModuleNotFoundError`의 근본 원인임을 확인했습니다.
+초기 아키텍처는 라이브러리 의존성 충돌을 피하기 위해 두 서비스를 분리했습니다. 최종적으로는 두 서비스 모두 **Vertex AI SDK (`google-cloud-aiplatform`)**를 사용하도록 통일했지만, 각 서비스의 책임(Parsing vs. Embedding)을 명확히 분리하고 독립적으로 확장 및 관리할 수 있다는 점에서 서비스 분리 아키텍처의 장점은 여전히 유효합니다.
 
-이를 해결하는 가장 올바르고 안정적인 방법은, **책임이 다른 두 프로세스를 별도의 Cloud Run 서비스로 완전히 분리**하는 것입니다.
-
-*   **`parser-service`**: PDF 파싱과 메타데이터 생성을 담당하며, `google-generativeai` 라이브러리만 사용합니다.
-*   **`embedder-service`**: 텍스트/멀티모달 임베딩과 DB 저장을 담당하며, `google-cloud-aiplatform` 라이브러리만 사용합니다.
-
-이 아키텍처는 라이브러리 충돌을 원천적으로 차단하고, 각 서비스를 독립적으로 관리 및 확장할 수 있게 해줍니다.
+*   **`parser-service`**: PDF를 페이지별로 파싱하고, 이미지와 텍스트를 추출하여 Gemini를 통해 메타데이터를 생성합니다. Pub/Sub 재시도에 의한 **반복 실행을 방지**하는 로직이 포함되어 있습니다.
+*   **`embedder-service`**: 파싱된 중간 데이터를 받아 **텍스트 임베딩(요약문 기반)**과 **이미지 임베딩(시각 정보 기반)**을 각각 생성하고, 최종 결과를 AlloyDB에 저장합니다. AlloyDB 연결 및 데이터 타입 관련 안정성 로직이 모두 적용되었습니다.
 
 ---
 
@@ -151,9 +147,8 @@ PDF를 파싱하고 Gemini 2.5 Pro를 통해 메타데이터를 추출한 후, �
     ```dockerfile
     # ... (기존 Dockerfile 내용) ...
     
-    # 빌드 검증 단계: 실제 코드에서 사용하는 핵심 모듈을 직접 임포트하여 검증합니다.
-    # 이 명령어가 성공하면, main.py에서도 임포트가 성공할 확률이 매우 높습니다.
-    RUN python -c "import google.generativeai; print('google-generativeai SDK verification successful.')"
+    # 빌드 검증 단계: Vertex AI SDK가 올바르게 설치되었는지 확인합니다.
+    RUN python -c "import vertexai; print('Vertex AI SDK verification successful.')"
     
     # ... (CMD 명령어) ...
     ```
@@ -167,40 +162,104 @@ PDF를 파싱하고 Gemini 2.5 Pro를 통해 메타데이터를 추출한 후, �
 
 *   **`main.py` (핵심 `init_clients` 함수)**
     ```python
-    import google.generativeai as genai
-    import google.auth
-    
-    # ... (기타 import 및 전역 변수 설정) ...
+    import base64, json, os, sys, traceback
+    from flask import Flask, request, jsonify
+    import fitz # PyMuPDF
+    from google.cloud import storage
+    import vertexai
+    from vertexai.generative_models import GenerativeModel, Part, GenerationConfig
+
+    # --- 환경 변수 ---
+    PROJECT_ID = os.environ.get("GCP_PROJECT")
+    MODEL_LOCATION = os.environ.get("MODEL_LOCATION", "us-central1")
+    PARSED_BUCKET_NAME = os.environ.get("PARSED_BUCKET")
+
+    clients_initialized = False
+    gemini_model = None
+    storage_client = None
+
+    SYSTEM_PROMPT = """
+    You are an expert in analyzing documents and structuring them into JSON...
+    """
+
+    app = Flask(__name__)
 
     def init_clients():
         global clients_initialized, gemini_model, storage_client
         if clients_initialized: return
 
-        print(f"Initializing clients for parser-service...")
+        print(f"Initializing clients with Vertex AI SDK...")
         try:
-            # 1. Cloud Run 환경의 서비스 계정 인증 정보를 가져옵니다.
-            credentials, project_id = google.auth.default()
-
-            # 2. [가장 중요] client_options를 설정하여 'quota_project_id'를 명시적으로 주입합니다.
-            #    이것이 교차 리전 호출 시 발생하는 PermissionDenied 오류를 해결하는 핵심입니다.
-            client_options = {"quota_project_id": PROJECT_ID}
-            print(f"Specifying quota project ID: {PROJECT_ID}")
-
-            # 3. 인증 정보와 할당량 프로젝트 정보를 모두 사용하여 genai를 설정합니다.
-            genai.configure(
-                credentials=credentials,
-                client_options=client_options,
-            )
-            
-            # 4. 모델과 스토리지 클라이언트를 초기화합니다.
-            gemini_model = genai.GenerativeModel("publishers/google/models/gemini-2.5-pro", system_instruction=SYSTEM_PROMPT)
-            storage_client = storage.Client(project=PROJECT_ID, credentials=credentials)
-
+            vertexai.init(project=PROJECT_ID, location=MODEL_LOCATION)
+            gemini_model = GenerativeModel("gemini-2.5-pro", system_instruction=SYSTEM_PROMPT)
+            storage_client = storage.Client(project=PROJECT_ID)
             clients_initialized = True
-            print("Parser clients initialized successfully with explicit quota project.")
-        
+            print("Vertex AI SDK clients initialized successfully.")
         except Exception as e:
-            # ... (에러 핸들링) ...
+            print(f"CRITICAL: Failed to initialize clients. Error: {e}", file=sys.stderr)
+            traceback.print_exc(); raise
+
+    @app.route("/", methods=["POST"])
+    def process_upload_event():
+        try:
+            init_clients()
+            
+            # ... (Pub/Sub 메시지 파싱) ...
+            decoded_data = base64.b64decode(request.json["message"]["data"]).decode("utf-8")
+            message_json = json.loads(decoded_data)
+            bucket_name = message_json.get("bucket")
+            file_name = message_json.get("name")
+
+            # 1. 멱등성 확인 (반복 처리 방지)
+            destination_bucket = storage_client.bucket(PARSED_BUCKET_NAME)
+            prefix = f"{file_name.replace('.pdf', '')}-page-"
+            if next(destination_bucket.list_blobs(prefix=prefix, max_results=1), None):
+                print(f"File '{file_name}' has already been processed. Skipping.")
+                return "OK", 204
+
+            print(f"Processing file: gs://{bucket_name}/{file_name}")
+            source_bucket = storage_client.bucket(bucket_name)
+            pdf_blob = source_bucket.blob(file_name)
+            pdf_document = fitz.open(stream=pdf_blob.download_as_bytes())
+
+            for i, page in enumerate(pdf_document):
+                page_num = i + 1
+                page_text = page.get_text().strip()
+                image_bytes = page.get_pixmap(dpi=150).tobytes("png")
+
+                print(f"  - Processing page {page_num}...")
+                
+                # 2. Crash 방지: 텍스트 없는 페이지 처리
+                page_text_for_gemini = page_text if page_text else "(No text content found on this page)"
+                
+                image_part = Part.from_data(data=image_bytes, mime_type="image/png")
+                response = gemini_model.generate_content(
+                    [image_part, page_text_for_gemini],
+                    generation_config=GenerationConfig(response_mime_type="application/json")
+                )
+                
+                intermediate_data = {
+                    "source_file": f"gs://{bucket_name}/{file_name}",
+                    "page_num": page_num,
+                    "page_text": page_text, # 원본 텍스트는 그대로 저장
+                    "image_base64": base64.b64encode(image_bytes).decode('utf-8'),
+                    "metadata": json.loads(response.text)
+                }
+
+                new_blob_name = f"{prefix}{page_num}.json"
+                destination_bucket.blob(new_blob_name).upload_from_string(
+                    json.dumps(intermediate_data, ensure_ascii=False),
+                    content_type="application/json"
+                )
+                print(f"  - Saved intermediate data to gs://{PARSED_BUCKET_NAME}/{new_blob_name}")
+
+            pdf_document.close()
+            print(f"Successfully processed {file_name}")
+            return "OK", 200
+        except Exception as e:
+            print(f"Error processing upload event: {e}", file=sys.stderr)
+            traceback.print_exc()
+            return "Internal Server Error", 500
     ```
 
 *   **배포 (`parser-service` 디렉토리에서 실행):**
@@ -229,7 +288,7 @@ PDF를 파싱하고 Gemini 2.5 Pro를 통해 메타데이터를 추출한 후, �
 
 #### **2.2 Embedder Service (`embedder-service`)**
 
-`parser-service`가 생성한 중간 JSON 파일을 입력받아, 임베딩을 생성하고 AlloyDB에 최종 저장합니다.
+`parser-service`가 생성한 중간 JSON 파일을 입력받아, **요약문 기반 텍스트 임베딩**과 **순수 이미지 기반 멀티모달 임베딩**을 생성하고 AlloyDB에 최종 저장합니다.
 
 *   **프로젝트 구조:**
     ```
@@ -272,31 +331,93 @@ PDF를 파싱하고 Gemini 2.5 Pro를 통해 메타데이터를 추출한 후, �
 
 *   **`main.py` (핵심 `init_clients` 함수)**
     ```python
+    import base64, json, os, ssl, sys, traceback
+    from flask import Flask, request
+    import pg8000.dbapi
+    from google.cloud import storage
     import vertexai
-    from vertexai.generative_models import GenerativeModel, Part
-    
-    # ... (기타 import 및 전역 변수 설정) ...
+    from vertexai.language_models import TextEmbeddingModel
+    from vertexai.vision_models import Image as VisionImage, MultiModalEmbeddingModel
+
+    # ... (환경 변수 및 전역 변수 설정) ...
+
+    app = Flask(__name__)
 
     def init_clients():
-        global clients_initialized, text_embedding_model, multimodal_embedding_model, storage_client
-        if clients_initialized: return
-        
-        print(f"Initializing clients with Vertex AI SDK...")
+        # ... (이전과 동일) ...
+
+    def get_db_connection():
+        """AlloyDB 데이터베이스에 대한 보안 연결을 생성합니다."""
+        print("Connecting to AlloyDB...")
         try:
-            # Vertex AI SDK는 GCP 환경의 컨텍스트(프로젝트, 인증)를 자동으로 인식합니다.
-            # location은 모델이 있는 리전을 명시합니다.
-            vertexai.init(project=PROJECT_ID, location=EMBEDDING_REGION)
+            # 1. SSL 인증서 검증 비활성화 (VPC 내부 통신용)
+            ssl_context = ssl.SSLContext()
+            ssl_context.verify_mode = ssl.CERT_NONE
+            ssl_context.check_hostname = False
             
-            # 모델과 클라이언트를 초기화합니다.
-            text_embedding_model = TextEmbeddingModel.from_pretrained("text-multilingual-embedding-002")
-            multimodal_embedding_model = MultiModalEmbeddingModel.from_pretrained("multimodalembedding@001")
-            storage_client = storage.Client(project=PROJECT_ID)
-            
-            clients_initialized = True
-            print("Embedder clients initialized successfully.")
-        
+            conn = pg8000.dbapi.connect(
+                host=DB_HOST, port=5432, user=DB_USER, password=DB_PASS, database=DB_NAME, ssl_context=ssl_context
+            )
+            print("AlloyDB connection successful.")
+            return conn
         except Exception as e:
-            # ... (에러 핸들링) ...
+            print(f"CRITICAL: Failed to connect to AlloyDB. Error: {e}", file=sys.stderr)
+            traceback.print_exc(); raise
+
+    @app.route("/", methods=["POST"])
+    def process_parsed_event():
+        # ... (Pub/Sub 메시지 파싱) ...
+        
+        try:
+            init_clients()
+            # ... (GCS에서 JSON 파일 다운로드) ...
+
+            summary = intermediate_data["metadata"]["summary"]
+            image_bytes = base64.b64decode(intermediate_data["image_base64"])
+
+            print("  - Generating text embedding for summary...")
+            text_embeddings = text_embedding_model.get_embeddings([summary])
+            
+            print("  - Generating multimodal embedding for image only...")
+            # 2. 순수 이미지 임베딩 생성 (텍스트 제외)
+            multimodal_embeddings = multimodal_embedding_model.get_embeddings(
+                image=VisionImage(image_bytes=image_bytes)
+            )
+
+            insert_data = (
+                intermediate_data["source_file"],
+                f"Content from page {intermediate_data['page_num']} of file {os.path.basename(intermediate_data['source_file'])}",
+                json.dumps(intermediate_data["metadata"], ensure_ascii=False),
+                # 3. pgvector 형식에 맞게 JSON 문자열로 변환
+                json.dumps(text_embeddings[0].values),
+                json.dumps(multimodal_embeddings.image_embedding) # 단일 이미지 결과는 .image_embedding 사용
+            )
+
+            print(f"  - Inserting record into AlloyDB...")
+            conn = None
+            cursor = None
+            try:
+                conn = get_db_connection()
+                cursor = conn.cursor()
+                # 4. SQL 쿼리에 명시적 타입 캐스팅(::vector) 추가
+                cursor.execute(
+                    """INSERT INTO document_embeddings
+                       (source_file, chunk_description, metadata, text_embedding, multimodal_embedding)
+                       VALUES (%s, %s, %s, %s::vector, %s::vector)""",
+                    insert_data
+                )
+                conn.commit()
+            finally:
+                # 5. 안정적인 DB 커서 및 연결 해제
+                if cursor: cursor.close()
+                if conn: conn.close()
+
+            print(f"Successfully processed and inserted data for gs://{bucket_name}/{file_name}.")
+            return "OK", 204
+        except Exception as e:
+            print(f"CRITICAL: Failed to process file {file_name}. Error: {e}", file=sys.stderr)
+            traceback.print_exc()
+            return "Internal Server Error", 500
     ```
 
 *   **배포 (`embedder-service` 디렉토리에서 실행):**
@@ -669,3 +790,25 @@ CREATE OR REPLACE TABLE `[YOUR_PROJECT_ID].[YOUR_DATASET_ID].evaluation_results`
 #### Q: 왜 파서(parser)와 임베더(embedder) 서비스를 분리해야 하나요?
 
 **A: 이것이 이 아키텍처의 가장 핵심적인 결정입니다.** `google-cloud-aiplatform` 라이브러리의 최신 버전은, 새로운 `google-generativeai` 라이브러리를 필수 의존성으로 포함합니다. 이로 인해 두 라이브러리가 하나의 환경에 함께 설치되면 **네임스페이스 충돌**이 발생하여, `google.cloud.aiplatform.language_models` 와 같은 예전 모듈 경로를 찾지 못하는 `ModuleNotFoundError`가 발생할 수 있습니다. **두 서비스의 책임을 명확히 분리하고 각각 필요한 라이브러리만 독립적으로 설치하는 것이 이 문제를 해결하는 가장 근본적이고 올바른 방법입니다.**
+
+#### Q: Parser Service가 동일한 파일을 계속 반복해서 처리합니다 (무한 루프).
+
+**A:** 두 가지 원인이 복합적으로 작용한 문제입니다.
+1.  **원인 1 (Crash):** PDF 페이지 중 텍스트가 전혀 없는 경우(`''`), 이를 그대로 Gemini API로 보내면 `InvalidArgument` 오류가 발생하여 서비스가 비정상 종료됩니다.
+2.  **원인 2 (Pub/Sub 재시도):** 서비스가 성공 응답(HTTP 2xx)을 보내지 못하면, Pub/Sub은 처리가 실패했다고 간주하고 동일한 메시지를 계속 재전송합니다.
+3.  **해결책:** `parser-service`의 `main.py`에 두 가지 로직을 모두 적용해야 합니다.
+    *   **멱등성(Idempotency) 확보:** GCS의 `parsed-json-bucket`에 결과 파일이 이미 있는지 먼저 확인하고, 있다면 즉시 성공(`204 No Content`)을 반환하여 처리를 건너뜁니다.
+    *   **빈 텍스트 처리:** `page.get_text()` 결과가 비어있으면, 에러 방지를 위해 `"(No text content found)"`와 같은 대체 텍스트를 Gemini에 전달합니다.
+
+#### Q: `embedder-service`에서 AlloyDB 접속 시 `SSL: CERTIFICATE_VERIFY_FAILED` 오류가 발생합니다.
+
+**A:** Private Service Connect(PSC)를 통해 AlloyDB에 접속 시, AlloyDB는 **자체 서명된(self-signed) SSL 인증서**를 사용합니다. Python의 기본 SSL 설정은 이를 신뢰하지 않아 발생하는 문제입니다.
+1.  **해결책:** `pg8000.dbapi.connect()` 함수에 전달할 커스텀 `ssl.SSLContext`를 생성해야 합니다. 이 컨텍스트에는 서버 인증서의 유효성 검사를 수행하지 않도록 (`verify_mode = ssl.CERT_NONE`) 설정해야 합니다. 이 방식은 VPC라는 보안 경계 내에서 통신하므로 안전합니다.
+
+#### Q: `embedder-service`에서 `invalid input syntax for type vector` 오류가 발생합니다.
+
+**A:** `pg8000` 라이브러리가 Python 리스트를 `pgvector`가 이해하지 못하는 형식(예: `'{...}'`)의 문자열로 변환하기 때문입니다.
+1.  **해결책:** `pgvector`가 가장 확실하게 이해하는 방식으로 SQL 쿼리를 수정해야 합니다.
+    *   Python 코드에서는 벡터 데이터(리스트)를 `json.dumps()`를 사용해 JSON 배열 형태의 문자열(예: `'[...]'`)로 변환합니다.
+    *   `INSERT` SQL 문에서는 해당 파라미터가 벡터임을 명시적으로 알려주는 **타입 캐스팅(`::vector`)**을 추가합니다. (예: `... VALUES (%s::vector)`)
+

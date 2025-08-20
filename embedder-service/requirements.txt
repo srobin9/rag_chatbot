@@ -1,6 +1,6 @@
-# 임베딩과 DB에만 집중
 Flask>=2.0.0
-gunicorn>=2.0.0
-google-cloud-aiplatform
+gunicorn>=20.0.0
 google-cloud-storage
 pg8000>=1.29.0
+# GCP 네이티브 라이브러리만 사용합니다.
+google-cloud-aiplatform[generative_ai]

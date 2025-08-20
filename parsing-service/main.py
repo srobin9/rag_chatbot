@@ -1,6 +1,10 @@
-import base64, json, os, sys, traceback
+import base64
+import json
+import os
+import sys
+import traceback
 from flask import Flask, request, jsonify
-import fitz
+import fitz  # PyMuPDF
 from google.cloud import storage
 
 # --- 올바른 라이브러리 임포트 ---
@@ -61,12 +65,13 @@ def process_upload_event():
         init_clients()
 
         envelope = request.json
-        # ... (이하 메시지 파싱 코드는 변경 없음)
         if not envelope or "message" not in envelope:
             return jsonify({"error": "Invalid Pub/Sub message format"}), 400
+
         pubsub_message = envelope["message"]
         if "data" not in pubsub_message:
             return jsonify({"error": "Pub/Sub message data missing"}), 400
+
         decoded_data = base64.b64decode(pubsub_message["data"]).decode("utf-8")
         message_json = json.loads(decoded_data)
         bucket_name = message_json.get("bucket")
@@ -74,6 +79,23 @@ def process_upload_event():
         if not bucket_name or not file_name:
             return jsonify({"error": "Missing 'bucket' or 'name' in message data"}), 400
 
+        # ==================================================================
+        # 1. 멱등성 확인 (Idempotency Check) - 핵심 변경 사항
+        # ==================================================================
+        # 결과물이 저장될 버킷과 파일 접두사를 정의합니다.
+        # (예: 'folder/doc.pdf' -> 'folder/doc-page-')
+        destination_bucket = storage_client.bucket(PARSED_BUCKET_NAME)
+        prefix = f"{file_name.replace('.pdf', '')}-page-"
+
+        # list_blobs를 사용하여 해당 prefix를 가진 파일이 하나라도 있는지 확인합니다.
+        # max_results=1은 매우 효율적인 확인 방법입니다.
+        existing_blobs = destination_bucket.list_blobs(prefix=prefix, max_results=1)
+        if next(existing_blobs, None):
+            print(f"File '{file_name}' has already been processed. Skipping.")
+            # 204 No Content는 Pub/Sub에 성공적으로 처리했음을 알려 메시지 재전송을 막습니다.
+            return "OK", 204
+        # ==================================================================
+        
         print(f"Processing file: gs://{bucket_name}/{file_name}")
 
         source_bucket = storage_client.bucket(bucket_name)
@@ -88,12 +110,25 @@ def process_upload_event():
             image_bytes = page.get_pixmap(dpi=150).tobytes("png")
 
             print(f"  - Processing page {page_num}...")
-            
+
+            # ==================================================================
+            # 2. Crash 방지 로직
+            # ==================================================================
+            # 페이지에서 추출된 텍스트가 비어 있는지 확인합니다.
+            if not page_text:
+                # 텍스트가 비어있으면 Gemini 에러 방지를 위해 대체 텍스트를 사용합니다.
+                page_text_for_gemini = "(No text content found on this page)"
+                print(f"    - Page {page_num} has no text. Using placeholder.")
+            else:
+                page_text_for_gemini = page_text
+            # ==================================================================
+                        
             # Vertex AI SDK가 권장하는 'Part' 객체를 사용하여 데이터를 안전하게 전달합니다.
             image_part = Part.from_data(data=image_bytes, mime_type="image/png")
             
+            # Gemini에 보낼 때는 항상 텍스트가 있도록 보장된 변수를 사용합니다.
             response = gemini_model.generate_content(
-                [image_part, page_text],
+                [image_part, page_text_for_gemini],
                 generation_config=GenerationConfig(response_mime_type="application/json")
             )
             
