@@ -582,7 +582,7 @@ deactivate
     *   연결된 데이터 스토어에서 `rag_db`를 클릭한 후 데이터 가져오기 상태를 확인합니다. 
         ![AlloyDB 데이터 가져오기](./image/alloydb_data_import.png)
 3.  **에이전트 테스트:**
-    *   데이터 저장소 생성이 완료되면 Agent Builder의 미리보기(Preview) 기능에서 바로 질문을 입력하여 테스트할 수 있습니다.
+    *   콘솔 좌측 상단의 `앱 개요`를 선택하면 Agentspace 웹 앱에 대한 정보가 보입니다. Agentspace 라이선스 구매 후 Agentspace 웹 앱 URL을 복사하여 다른 브라우저 탭에서 열면 Agentspace가 구동되는 것을 확인할 수 있습니다. 
     *   에이전트는 사용자의 질문을 자동으로 임베딩하고, AlloyDB에서 벡터 검색(Semantic Search)을 수행하여 가장 관련성 높은 `content`를 찾은 후, Gemini 모델을 사용하여 최종 답변을 생성합니다.
 
 ---
