@@ -579,6 +579,8 @@ deactivate
     *   DB 연결 정보를 입력합니다: 프로젝트 ID, 인스턴스 ID, 데이터베이스 이름, 테이블 이름(`document_embeddings`), 사용자 인증 정보 등을 아래 이미지처럼 입력하고 계속 버튼을 클릭합니다.
         ![AlloyDB 연결 정보](./image/alloydb_connection_info.png)
     *   구성에서는 **데이터 스토어 이름**에 `rag_db`를 입력한 후 `만들기`를 클릭합니다.
+    *   연결된 데이터 스토어에서 `rag_db`를 클릭한 후 데이터 가져오기 상태를 확인합니다. 
+        ![AlloyDB 데이터 가져오기](./image/alloydb_data_import.png)
 3.  **에이전트 테스트:**
     *   데이터 저장소 생성이 완료되면 Agent Builder의 미리보기(Preview) 기능에서 바로 질문을 입력하여 테스트할 수 있습니다.
     *   에이전트는 사용자의 질문을 자동으로 임베딩하고, AlloyDB에서 벡터 검색(Semantic Search)을 수행하여 가장 관련성 높은 `content`를 찾은 후, Gemini 모델을 사용하여 최종 답변을 생성합니다.
