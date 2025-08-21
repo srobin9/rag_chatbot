@@ -570,12 +570,15 @@ deactivate
 
 1.  **Vertex AI Agent Builder에서 앱 생성:**
     *   [Vertex AI Agent Builder 콘솔](https://console.cloud.google.com/gen-app-builder)로 이동합니다.
-    *   새로운 `검색(Search)` 또는 `채팅(Chat)` 앱을 생성합니다.
+    *   콘솔 화면 좌측 상단의 `앱 만들기` 링크를 클릭합니다.
+    *   Agentspace의 `만들기`를 클릭합니다.
+    *   앱 이름은 `Agentspace-RAG-Chatbot`로 하고 위치는 `global (전역)`을 선택한 후 `만들기 버튼을 클릭합니다.
+    *   생성된 `Agentspace-RAG-Chatbot`을 클릭한 후 `데이터 스토어 만들기`를 클릭합니다.
 2.  **데이터 저장소(Data Store) 구성:**
-    *   앱 설정에서 '데이터 저장소' 섹션으로 이동하여 '새 데이터 저장소'를 만듭니다.
     *   데이터 소스로 **'AlloyDB'**를 선택합니다.
-    *   DB 연결 정보를 입력합니다: 프로젝트 ID, 인스턴스 ID, 데이터베이스 이름, 테이블 이름(`document_embeddings`), 사용자 인증 정보 등.
-    *   **콘텐츠 열**에는 `content`를, **임베딩 열**에는 `embedding`을 매핑합니다.
+    *   DB 연결 정보를 입력합니다: 프로젝트 ID, 인스턴스 ID, 데이터베이스 이름, 테이블 이름(`document_embeddings`), 사용자 인증 정보 등을 아래 이미지처럼 입력하고 계속 버튼을 클릭합니다.
+        ![AlloyDB 연결 정보](./image/alloydb_connection_info.png)
+    *   구성에서는 **데이터 스토어 이름**에 `rag_db`를 입력한 후 `만들기`를 클릭합니다.
 3.  **에이전트 테스트:**
     *   데이터 저장소 생성이 완료되면 Agent Builder의 미리보기(Preview) 기능에서 바로 질문을 입력하여 테스트할 수 있습니다.
     *   에이전트는 사용자의 질문을 자동으로 임베딩하고, AlloyDB에서 벡터 검색(Semantic Search)을 수행하여 가장 관련성 높은 `content`를 찾은 후, Gemini 모델을 사용하여 최종 답변을 생성합니다.
